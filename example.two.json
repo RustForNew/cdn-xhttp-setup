@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "name": "CDN XHTTP",
+  "origin": {"host": "203.0.113.10", "user": "root", "port": 22},
+  "origin_domain": "origin.example.com",
+  "cdn_domain": "cdn.example.com",
+  "email": "admin@example.com",
+  "exit": {"host": "203.0.113.20", "user": "root", "port": 22},
+  "exit_domain": "relay.example.com",
+  "uuid": "b46343f6-7587-4e1a-a66a-5659b579f91e",
+  "path": "/api-test",
+  "padding_key": "dc",
+  "profile": "fast",
+  "xray_version": "26.5.9"
+}

@@ -44,6 +44,29 @@ def server(value: dict) -> dict:
     return {"host": host, "user": user, "port": port}
 
 
+def certificate_email(value: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not re.fullmatch(
+            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", value
+        )
+        or len(value) > 254
+    ):
+        raise ValueError("Укажите email для Let's Encrypt")
+    return value
+
+
+def connection_name(value: str) -> str:
+    if not isinstance(value, str) or any(
+        unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for char in value
+    ):
+        raise ValueError("Название должно быть строкой без управляющих символов")
+    value = value.strip()
+    if not 1 <= len(value) <= 80:
+        raise ValueError("Название должно содержать от 1 до 80 символов")
+    return value
+
+
 def validate(value: dict) -> dict:
     allowed = {
         "schema",
@@ -74,23 +97,8 @@ def validate(value: dict) -> dict:
         c[key] = domain(c[key])
     if c["origin_domain"] == c["cdn_domain"]:
         raise ValueError("Origin и CDN должны иметь разные домены")
-    email = c.get("email", "")
-    if (
-        not isinstance(email, str)
-        or not re.fullmatch(
-            r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", email
-        )
-        or len(email) > 254
-    ):
-        raise ValueError("Укажите email для Let's Encrypt")
-    name = c.get("name", "CDN XHTTP")
-    if not isinstance(name, str) or any(
-        unicodedata.category(char) in {"Cc", "Cf", "Cs", "Zl", "Zp"} for char in name
-    ):
-        raise ValueError("Название должно быть строкой без управляющих символов")
-    c["name"] = name.strip()
-    if not 1 <= len(c["name"]) <= 80:
-        raise ValueError("Название должно содержать от 1 до 80 символов")
+    c["email"] = certificate_email(c.get("email", ""))
+    c["name"] = connection_name(c.get("name", "CDN XHTTP"))
     values = c.get("uuids", [c.get("uuid")])
     if not isinstance(values, list) or not 1 <= len(values) <= 1000:
         raise ValueError("uuids должен содержать от 1 до 1000 уникальных UUID")

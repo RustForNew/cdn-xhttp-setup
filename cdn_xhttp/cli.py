@@ -13,7 +13,16 @@ import uuid
 from pathlib import Path
 
 from . import __version__
-from .config import load, validate, write_private
+from .config import (
+    DEFAULT_PATH,
+    certificate_email,
+    connection_name,
+    domain,
+    load,
+    server,
+    validate,
+    write_private,
+)
 from .render import client_xray, extra, nginx_config, origin_xray, exit_xray, vless_uri
 
 
@@ -22,46 +31,158 @@ def ask(label: str, default: str = "") -> str:
     return answer or default
 
 
-def yes(label: str) -> bool:
-    return input(label + " [yes/нет]: ").strip().lower() in {"yes", "да"}
+def yes(label: str, default: bool = False) -> bool:
+    while True:
+        choice = (
+            input(f"{label} [Y/N, Enter = {'Y' if default else 'N'}]: ").strip().lower()
+        )
+        if not choice:
+            return default
+        if choice in {"y", "yes", "да", "д"}:
+            return True
+        if choice in {"n", "no", "нет", "н"}:
+            return False
+        print("Введите Y (да) или N (нет).")
 
 
-def ask_server(label: str) -> dict:
-    print(f"\n{label}")
-    return {
-        "host": ask("IP сервера"),
-        "user": ask("SSH login", "root"),
-        "port": int(ask("SSH port", "22")),
+def ask_validated(label: str, validator, default: str = ""):
+    while True:
+        try:
+            return validator(ask(label, default))
+        except (ValueError, UnicodeError) as exc:
+            print(f"{exc}. Попробуйте ещё раз.")
+
+
+def number(value: str, minimum: int, maximum: int) -> int:
+    try:
+        result = int(value)
+    except ValueError:
+        raise ValueError(f"Введите целое число от {minimum} до {maximum}") from None
+    if not minimum <= result <= maximum:
+        raise ValueError(f"Введите целое число от {minimum} до {maximum}")
+    return result
+
+
+def ask_credentials(s: dict) -> dict:
+    print("Пароль вводится скрыто: символы не отображаются и не сохраняются в файл.")
+    credentials = {
+        "password": getpass.getpass(
+            f"SSH-пароль {s['user']}@{s['host']} (Enter — использовать SSH-ключ): "
+        )
+        or None,
+        "sudo_password": None,
     }
+    if s["user"] != "root":
+        credentials["sudo_password"] = (
+            getpass.getpass("Пароль sudo (Enter — sudo без пароля): ") or None
+        )
+    return credentials
 
 
-def wizard(path: Path) -> dict:
-    if path.exists():
+def ask_server(
+    label: str,
+    credentials: dict | None = None,
+    role: str = "origin",
+    origin: dict | None = None,
+) -> dict:
+    print(f"\n{label}")
+
+    def address(value):
+        try:
+            ip = ipaddress.ip_address(value)
+        except ValueError:
+            raise ValueError("Укажите корректный IP-адрес сервера") from None
+        if origin:
+            other = ipaddress.ip_address(origin["host"])
+            if ip == other:
+                raise ValueError("Для моста нужны два разных сервера")
+            if ip.version != other.version:
+                raise ValueError("Оба сервера должны использовать IPv4 или оба IPv6")
+        return str(ip)
+
+    s = {"host": ask_validated("IP сервера", address)}
+    s["user"] = ask_validated(
+        "SSH-логин", lambda value: server({**s, "user": value})["user"], "root"
+    )
+    s["port"] = ask_validated("SSH-порт", lambda value: number(value, 1, 65535), "22")
+    if credentials is not None:
+        credentials[role] = ask_credentials(s)
+    return s
+
+
+def ask_domain(label: str, used: tuple[str, ...] = ()) -> str:
+    def unique(value):
+        result = domain(value)
+        if result in used:
+            raise ValueError("Для этого назначения нужен отдельный домен")
+        return result
+
+    return ask_validated(label, unique)
+
+
+def wizard(
+    path: Path, credentials: dict | None = None, *, replace_existing: bool = False
+) -> dict:
+    if path.is_symlink():
+        raise ValueError("Файл конфигурации не должен быть символической ссылкой")
+    if path.exists() and not replace_existing:
         raise ValueError(
             f"Файл {path} уже существует. Используйте deploy --config или другой --config"
         )
     print("CDN XHTTP Setup — готовый CDN + Ubuntu 22.04/24.04")
-    name = ask("Название сервера (VLESS-ссылок)", "CDN XHTTP")
-    count = int(ask("Количество ссылок с разными UUID (1–1000)", "1"))
-    if not 1 <= count <= 1000:
-        raise ValueError("Количество ссылок должно быть от 1 до 1000")
-    uuids = [str(uuid.uuid4()) for _ in range(count)]
+    print("Без моста нужен один VPS. С мостом — входной VPS и отдельный выходной VPS.")
+    bridge = yes("Использовать мост из двух серверов?")
     c = {
-        "name": name,
-        "uuids": uuids,
-        "origin": ask_server("Origin (единственный сервер в режиме 1 VPS)"),
-        "cdn_domain": ask("CDN-домен клиентов"),
-        "origin_domain": ask("Origin-домен"),
-        "email": ask("Email для выпуска сертификата Let's Encrypt"),
-        "uuid": uuids[0],
+        "origin": ask_server(
+            "Входной сервер — принимает подключения от CDN" if bridge else "Сервер",
+            credentials,
+            "origin",
+        ),
         "exit": None,
     }
-    if yes("Использовать отдельный выходной сервер?"):
-        c["exit"] = ask_server("Exit")
-        c["exit_domain"] = ask("Exit-домен для TLS")
-    c["profile"] = ask("Профиль отправки: fast (5 мс) / original (30 мс)", "fast")
-    c["path"] = ask("XHTTP path", "/api-test")
+    c["origin_domain"] = ask_domain("Домен этого сервера (origin)")
+    if bridge:
+        c["exit"] = ask_server(
+            "Выходной сервер — через него будет выход в интернет",
+            credentials,
+            "exit",
+            origin=c["origin"],
+        )
+        c["exit_domain"] = ask_domain("Домен выходного сервера", (c["origin_domain"],))
+    print("\nCDN и ссылки для пользователей")
+    c["cdn_domain"] = ask_domain(
+        "CDN-домен клиентов", (c["origin_domain"], c.get("exit_domain", ""))
+    )
+    c["email"] = ask_validated(
+        "Email для выпуска сертификата Let's Encrypt", certificate_email
+    )
+    c["name"] = ask_validated(
+        "Название сервера (VLESS-ссылок)", connection_name, "CDN XHTTP"
+    )
+    count = ask_validated(
+        "Количество ссылок с разными UUID (1–1000)",
+        lambda value: number(value, 1, 1000),
+        "1",
+    )
+    c["uuids"] = [str(uuid.uuid4()) for _ in range(count)]
+    c["uuid"] = c["uuids"][0]
+    c["profile"] = "fast"
+    c["path"] = DEFAULT_PATH
     c = validate(c)
+    if path.exists():
+        index = 1
+        backup = path.with_name(f"{path.stem}.backup-{index}{path.suffix}")
+        while backup.exists() or backup.is_symlink():
+            index += 1
+            backup = path.with_name(f"{path.stem}.backup-{index}{path.suffix}")
+        # Preserve the old file byte-for-byte, including BOM and line endings.
+        import os
+
+        with os.fdopen(
+            os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        ) as f:
+            f.write(path.read_bytes())
+        print(f"Прежняя конфигурация сохранена: {backup}")
     write_private(path, json.dumps(c, indent=2, ensure_ascii=False) + "\n")
     print(f"Параметры сохранены: {path}. Файл содержит UUID доступа, но не SSH-пароли.")
     return c
@@ -162,50 +283,70 @@ def check(c: dict) -> dict:
     return checks
 
 
-def deploy(c: dict, args: argparse.Namespace) -> int:
+def show_summary(c: dict) -> None:
+    print(
+        f"\nРежим: {'мост, 2 сервера' if c.get('exit') else 'один сервер, без моста'}"
+    )
+    for role, label in (
+        ("origin", "Входной сервер" if c.get("exit") else "Сервер"),
+        ("exit", "Выходной сервер"),
+    ):
+        if c.get(role):
+            s = c[role]
+            print(
+                f"{label}: {s['user']}@{s['host']}:{s['port']} — {c[role + '_domain']}"
+            )
+    print(f"CDN-домен: {c['cdn_domain']}")
+    print(f"Название: {c['name']}; ссылок: {len(c['uuids'])}")
+
+
+def redact(text: str, credentials: dict) -> str:
+    for secrets in credentials.values():
+        for value in secrets.values():
+            if value:
+                text = text.replace(value, "[скрыто]")
+    return text
+
+
+def deploy(c: dict, args: argparse.Namespace, credentials: dict | None = None) -> int:
     from .remote import deploy_server
 
-    print(
-        f"Режим: {'2 VPS' if c.get('exit') else '1 VPS'}; origin={c['origin']['host']}; CDN={c['cdn_domain']}; профиль={c['profile']}"
-    )
+    credentials = credentials if credentials is not None else {}
+    show_summary(c)
     print(
         "Будут установлены Xray, Certbot и службы проекта; на origin — Nginx. Нужен выделенный VPS без посторонних сайтов на 80/443."
     )
-    dns_preflight(c)
     if not args.yes and not yes(
         "Начать настройку указанных VPS и выпуск сертификатов Let's Encrypt?"
     ):
-        print("Установка отменена. Конфигурация сохранена.")
+        print(
+            "Установка отменена. Запустите программу снова, чтобы продолжить с этими настройками."
+        )
         return 0
-    # Passwords are requested per host, after the review. Agent/key auth works with blank password.
+    # Collect both servers' credentials before changing either VPS.
+    for role in ("origin", "exit"):
+        if c.get(role) and role not in credentials:
+            credentials[role] = ask_credentials(c[role])
+    dns_preflight(c)
     for role in ("exit", "origin"):
         s = c.get(role)
         if not s:
             continue
-        password = (
-            getpass.getpass(
-                f"SSH пароль {s['user']}@{s['host']} (Enter: SSH agent/ключ): "
-            )
-            or None
-        )
-        sudo_password = None
-        if s["user"] != "root":
-            sudo_password = getpass.getpass("Пароль sudo (Enter: NOPASSWD): ") or None
         try:
             deploy_server(
                 c,
                 role,
-                password=password,
-                sudo_password=sudo_password,
+                password=credentials[role]["password"],
+                sudo_password=credentials[role]["sudo_password"],
                 known_hosts=args.known_hosts,
                 confirm_host=lambda message: yes(
                     message
                     + "\nСверьте fingerprint с консолью VPS. Доверять этому ключу?"
                 ),
-                log=lambda text: print(text, flush=True),
+                log=lambda text: print(redact(text, credentials), flush=True),
             )
-        finally:
-            password = sudo_password = None
+        except Exception as exc:
+            raise RuntimeError(redact(str(exc), credentials)) from None
     checks = check(c)
     verified = all(item["ok"] for item in checks.values())
     write_connection(c, args.output, verified, checks)
@@ -243,6 +384,18 @@ def plan(c: dict, directory: Path) -> None:
     print(f"План без SSH и изменений на серверах: {directory.resolve()}")
 
 
+def existing_action(path: Path) -> str:
+    print(f"Найдена сохранённая конфигурация: {path}")
+    print("1 — Продолжить установку с сохранёнными настройками и UUID")
+    print("2 — Настроить заново (прежний файл сохранится в резервной копии)")
+    print("3 — Выход")
+    while True:
+        choice = ask("Выберите действие", "1")
+        if choice in {"1", "2", "3"}:
+            return choice
+        print("Введите 1, 2 или 3.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="VLESS XHTTP TLS: настройка VPS под существующий CDN"
@@ -263,10 +416,23 @@ def main(argv: list[str] | None = None) -> int:
         help="Пропустить обзор установки; проверка нового SSH-ключа всё равно интерактивна",
     )
     args = parser.parse_args(argv)
+    credentials: dict = {}
     try:
-        c = wizard(args.config) if args.command == "wizard" else load(args.config)
+        if args.command == "wizard":
+            action = existing_action(args.config) if args.config.exists() else "2"
+            if action == "3":
+                return 0
+            c = (
+                load(args.config)
+                if action == "1"
+                else wizard(
+                    args.config, credentials, replace_existing=args.config.exists()
+                )
+            )
+        else:
+            c = load(args.config)
         if args.command in {"wizard", "deploy"}:
-            return deploy(c, args)
+            return deploy(c, args, credentials)
         if args.command == "plan":
             plan(c, args.output)
         elif args.command == "check":
@@ -282,14 +448,18 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except (KeyboardInterrupt, EOFError):
         print(
-            "\nОперация прервана. Повторный deploy использует тот же UUID из конфигурации.",
+            "\nОперация прервана. При следующем запуске можно продолжить с сохранённой конфигурацией, если она была создана.",
             file=sys.stderr,
         )
         return 130
     except Exception as exc:
         # Do not print tracebacks or connection object reprs containing credentials.
-        print(f"Ошибка: {exc}", file=sys.stderr)
+        print(f"Ошибка: {redact(str(exc), credentials)}", file=sys.stderr)
         return 1
+    finally:
+        for secrets in credentials.values():
+            secrets.clear()
+        credentials.clear()
 
 
 if __name__ == "__main__":

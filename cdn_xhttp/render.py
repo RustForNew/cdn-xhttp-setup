@@ -153,7 +153,7 @@ def client_xray(c: dict, index: int = 0) -> dict:
                 "settings": {
                     "vnext": [
                         {
-                            "address": c["cdn_domain"],
+                            "address": c.get("connect_address", c["cdn_domain"]),
                             "port": 443,
                             "users": [{"id": identity, "encryption": "none"}],
                         }
@@ -195,7 +195,10 @@ def vless_uri(c: dict, index: int = 0) -> str:
         "mode": "packet-up",
         "extra": json.dumps(extra(c), separators=(",", ":")),
     }
-    return f"vless://{identity}@{c['cdn_domain']}:443?{urlencode(params, quote_via=quote)}#{quote(label, safe='')}"
+    address = c.get("connect_address", c["cdn_domain"])
+    if ":" in address:
+        address = f"[{address}]"
+    return f"vless://{identity}@{address}:443?{urlencode(params, quote_via=quote)}#{quote(label, safe='')}"
 
 
 def nginx_config(c: dict, tls: bool = True) -> str:

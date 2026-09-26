@@ -73,6 +73,7 @@ def validate(value: dict) -> dict:
         "origin",
         "origin_domain",
         "cdn_domain",
+        "connect_address",
         "email",
         "exit",
         "exit_domain",
@@ -95,6 +96,21 @@ def validate(value: dict) -> dict:
     c["origin"] = server(c["origin"])
     for key in ("origin_domain", "cdn_domain"):
         c[key] = domain(c[key])
+    if "connect_address" in c:
+        value = c["connect_address"]
+        if not isinstance(value, str) or "%" in value:
+            raise ValueError(
+                "connect_address должен быть публичным IP без зоны интерфейса"
+            )
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError as exc:
+            raise ValueError(
+                "connect_address должен быть публичным IPv4 или IPv6"
+            ) from exc
+        if not address.is_global or address.is_multicast or address.is_reserved:
+            raise ValueError("connect_address должен быть публичным IPv4 или IPv6")
+        c["connect_address"] = str(address)
     if c["origin_domain"] == c["cdn_domain"]:
         raise ValueError("Origin и CDN должны иметь разные домены")
     c["email"] = certificate_email(c.get("email", ""))
@@ -162,11 +178,17 @@ def load(path: Path) -> dict:
 
 def write_private(path: Path, text: str) -> None:
     """Never write SSH secrets. UUID/share links are intentionally local artifacts."""
-    path.parent.mkdir(parents=True, exist_ok=True)
     import os
+    import tempfile
 
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-    if os.name != "nt":
-        path.chmod(0o600)
+    if path.is_symlink():
+        raise ValueError("Файл результата не должен быть символической ссылкой")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)

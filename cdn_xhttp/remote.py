@@ -82,7 +82,21 @@ def _stage(name: str, value: str) -> str:
     return f"printf '%s' '{_encoded(value)}' | base64 -d > \"$STAGING/{name}\"\n"
 
 
-def render_bootstrap(config: dict, role: str) -> str:
+def _identity(config: dict, role: str) -> str:
+    return (
+        json.dumps(
+            {
+                "role": role,
+                "domain": config[f"{role}_domain"],
+                "cdn_domain": config["cdn_domain"],
+            },
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def render_bootstrap(config: dict, role: str, *, previous: dict | None = None) -> str:
     """Render a root bash script; its contents include the private VLESS UUID."""
     from .render import exit_xray, nginx_config, origin_xray
 
@@ -108,18 +122,42 @@ def render_bootstrap(config: dict, role: str) -> str:
         "XRAY_VERSION": version,
         "DEFAULT_SSH_PORT": str(server.get("port", 22)),
     }
-    identity = (
-        json.dumps(
-            {"role": role, "domain": domain, "cdn_domain": config["cdn_domain"]},
-            sort_keys=True,
-        )
-        + "\n"
-    )
+    identity = _identity(config, role)
+    if previous is not None:
+        if not previous.get(role) or previous[role]["host"] != server["host"]:
+            raise ValueError("An update cannot move an existing role to another server")
+        if bool(previous.get("exit")) != bool(config.get("exit")):
+            raise ValueError(
+                "Changing the deployment topology requires a new installation"
+            )
     header = "#!/usr/bin/env bash\nset -Eeuo pipefail\nexport LC_ALL=C\numask 077\n"
     header += "\n".join(
         f"{key}={shlex.quote(value)}" for key, value in settings.items()
     )
     header += "\nIDENTITY=" + shlex.quote(_encoded(identity)) + "\n"
+    header += (
+        "PREVIOUS_IDENTITY="
+        + shlex.quote(_encoded(_identity(previous, role)) if previous else "")
+        + "\n"
+    )
+    previous_xray = (
+        (origin_xray(previous) if role == "origin" else exit_xray(previous))
+        if previous
+        else None
+    )
+    header += (
+        "PREVIOUS_XRAY="
+        + shlex.quote(_encoded(json.dumps(previous_xray)) if previous else "")
+        + "\n"
+    )
+    current_xray = origin_xray(config) if role == "origin" else exit_xray(config)
+    header += "CURRENT_XRAY=" + shlex.quote(_encoded(json.dumps(current_xray))) + "\n"
+    header += (
+        "PREVIOUS_SETUP="
+        + shlex.quote(_encoded(json.dumps(previous)) if previous else "")
+        + "\n"
+    )
+    header += "TARGET_SETUP=" + shlex.quote(_encoded(json.dumps(config))) + "\n"
     payload = _stage(
         "config.json",
         json.dumps(
@@ -128,6 +166,7 @@ def render_bootstrap(config: dict, role: str) -> str:
         + "\n",
     )
     payload += _stage("cdn-xhttp.service", XRAY_SERVICE)
+    payload += _stage("setup.json", json.dumps(config, indent=2) + "\n")
     if role == "origin":
         from .health import HEALTH_SERVER_SOURCE
 
@@ -165,8 +204,37 @@ fi
 OWN_PATHS+=(/etc/letsencrypt/renewal-hooks/deploy/cdn-xhttp.sh)
 MANAGED=0
 if [[ -f /etc/cdn-xhttp/deployment.json && ! -L /etc/cdn-xhttp/deployment.json ]]; then
-    [[ "$(cat /etc/cdn-xhttp/deployment.json)" == "$(printf '%s' "$IDENTITY" | base64 -d)" ]] || fail "This server belongs to a different cdn-xhttp deployment/domain."
+    EXPECTED_IDENTITY="${PREVIOUS_IDENTITY:-$IDENTITY}"
+    FOUND_IDENTITY=$(cat /etc/cdn-xhttp/deployment.json)
+    [[ "$FOUND_IDENTITY" == "$(printf '%s' "$EXPECTED_IDENTITY" | base64 -d)" || "$FOUND_IDENTITY" == "$(printf '%s' "$IDENTITY" | base64 -d)" ]] || fail "Deployment changed since it was read; reconnect before updating."
     MANAGED=1
+fi
+[[ -z "$PREVIOUS_IDENTITY" || "$MANAGED" == 1 ]] || fail "The installation to update is missing."
+if [[ -n "$PREVIOUS_XRAY" ]]; then
+    PREVIOUS_XRAY="$PREVIOUS_XRAY" CURRENT_XRAY="$CURRENT_XRAY" python3 - <<'PY_PREVIOUS'
+import base64, json, os, pathlib
+p = pathlib.Path('/etc/cdn-xhttp/config.json')
+if p.is_symlink() or json.loads(p.read_text()) not in [json.loads(base64.b64decode(os.environ[key])) for key in ('PREVIOUS_XRAY', 'CURRENT_XRAY')]:
+    raise SystemExit('ERROR: Xray configuration changed since it was read; reconnect before updating.')
+PY_PREVIOUS
+    PREVIOUS_SETUP="$PREVIOUS_SETUP" TARGET_SETUP="$TARGET_SETUP" python3 - <<'PY_SETUP'
+import base64, json, os, pathlib
+def canonical(value):
+    value = dict(value)
+    value.pop('connect_address', None)
+    for role in ('origin', 'exit'):
+        if value.get(role):
+            value[role] = {'host': value[role]['host']}
+    return value
+p = pathlib.Path('/etc/cdn-xhttp/setup.json')
+if p.is_symlink():
+    raise SystemExit('ERROR: Saved setup is a symlink.')
+if p.exists():
+    current = canonical(json.loads(p.read_text()))
+    expected = [canonical(json.loads(base64.b64decode(os.environ[key]))) for key in ('PREVIOUS_SETUP', 'TARGET_SETUP')]
+    if current not in expected:
+        raise SystemExit('ERROR: Saved settings changed since they were read; reconnect before updating.')
+PY_SETUP
 fi
 for item in "${OWN_PATHS[@]}"; do
     if [[ "$MANAGED" == 0 && ( -e "$item" || -L "$item" ) ]]; then
@@ -178,9 +246,22 @@ for item in "${OWN_PATHS[@]}"; do
 done
 [[ ! -L /var/lib/cdn-xhttp && ! -L /var/lib/cdn-xhttp/certificate-owner.json ]] || fail "Unexpected certificate ownership symlink."
 if [[ -e /var/lib/cdn-xhttp/certificate-owner.json ]]; then
-    [[ "$(cat /var/lib/cdn-xhttp/certificate-owner.json)" == "$(printf '%s' "$IDENTITY" | base64 -d)" ]] || fail "Certificate ownership belongs to another deployment."
+    CERT_OWNER=$(cat /var/lib/cdn-xhttp/certificate-owner.json)
+    [[ "$CERT_OWNER" == "$(printf '%s' "$IDENTITY" | base64 -d)" || ( -n "$PREVIOUS_IDENTITY" && "$CERT_OWNER" == "$(printf '%s' "$PREVIOUS_IDENTITY" | base64 -d)" ) ]] || fail "Certificate ownership belongs to another deployment."
 elif [[ "$MANAGED" == 0 && -e "/etc/letsencrypt/live/$DOMAIN" ]]; then
     fail "An existing unmanaged certificate uses this domain; use a fresh VPS or inspect it manually."
+fi
+[[ ! -L /var/lib/cdn-xhttp/certificates && ! -L "/var/lib/cdn-xhttp/certificates/$DOMAIN.json" ]] || fail "Unexpected certificate record symlink."
+if [[ -n "$PREVIOUS_IDENTITY" && -e "/etc/letsencrypt/live/$DOMAIN" ]]; then
+    # A domain change may not appropriate a certificate from another service.
+    python3 - "$PREVIOUS_IDENTITY" "$DOMAIN" <<'PY_CERT'
+import base64, json, pathlib, sys
+previous = json.loads(base64.b64decode(sys.argv[1]))
+if previous['domain'] != sys.argv[2]:
+    record = pathlib.Path('/var/lib/cdn-xhttp/certificates') / (sys.argv[2] + '.json')
+    if not record.is_file() or json.loads(record.read_text()).get('role') != previous['role']:
+        raise SystemExit('ERROR: New domain already has a certificate not owned by this installation.')
+PY_CERT
 fi
 for unit in cdn-xhttp.service cdn-xhttp-health.service; do
     [[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" != masked ]] || fail "$unit is masked."
@@ -361,10 +442,31 @@ install -d -m 750 -o root -g nogroup /etc/cdn-xhttp
 install -m 755 "$STAGING/xray" /opt/cdn-xhttp/xray.new
 mv -f /opt/cdn-xhttp/xray.new /opt/cdn-xhttp/xray
 install -m 640 -o root -g nogroup "$STAGING/config.json" /etc/cdn-xhttp/config.json
+install -m 600 -o root -g root "$STAGING/setup.json" /etc/cdn-xhttp/setup.json
 install -m 644 "$STAGING/cdn-xhttp.service" /etc/systemd/system/cdn-xhttp.service
 install -d -m 700 /var/lib/cdn-xhttp
-# Retained with the certificate on rollback, so the same deployment can retry.
-printf '%s' "$IDENTITY" | base64 -d > /var/lib/cdn-xhttp/certificate-owner.json
+# Domain records are retained with certificates on rollback; global ownership
+# changes only on successful completion of a managed update.
+install -d -m 700 /var/lib/cdn-xhttp/certificates
+# Migrate the legacy single ownership record before retaining a new domain.
+# This lets an existing installation return to its own earlier certificate.
+python3 - <<'PY_KEEP_CERT'
+import json, pathlib
+base = pathlib.Path('/var/lib/cdn-xhttp')
+owner = base / 'certificate-owner.json'
+if owner.exists():
+    identity = json.loads(owner.read_text())
+    record = base / 'certificates' / (identity['domain'] + '.json')
+    if record.is_symlink():
+        raise SystemExit('ERROR: Certificate ownership record is a symlink.')
+    if not record.exists():
+        record.write_text(json.dumps(identity, sort_keys=True) + '\n')
+        record.chmod(0o600)
+PY_KEEP_CERT
+printf '%s' "$IDENTITY" | base64 -d > "/var/lib/cdn-xhttp/certificates/$DOMAIN.json"
+if [[ "$MANAGED" == 0 ]]; then
+    printf '%s' "$IDENTITY" | base64 -d > /var/lib/cdn-xhttp/certificate-owner.json
+fi
 
 if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     note "UFW is active: preserving SSH before adding service rules."
@@ -452,6 +554,7 @@ chmod 755 /etc/letsencrypt/renewal-hooks/deploy/cdn-xhttp.sh
 systemctl enable --now certbot.timer
 printf '%s' "$IDENTITY" | base64 -d > /etc/cdn-xhttp/deployment.json
 chmod 600 /etc/cdn-xhttp/deployment.json
+printf '%s' "$IDENTITY" | base64 -d > /var/lib/cdn-xhttp/certificate-owner.json
 COMPLETE=1
 note "$ROLE installation complete. Backup retained: $BACKUP"
 """
@@ -461,6 +564,209 @@ def _redact(text: str, secrets: list[str]) -> str:
     for secret in sorted((s for s in secrets if s), key=len, reverse=True):
         text = text.replace(secret, "[REDACTED]")
     return text
+
+
+def _connect(
+    server: dict,
+    password: str | None,
+    known_hosts: Path,
+    confirm_host: Callable[[str], bool],
+):
+    import paramiko
+
+    known_hosts = Path(known_hosts)
+
+    class ConfirmHostKey(paramiko.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            digest = (
+                base64.b64encode(hashlib.sha256(key.asbytes()).digest())
+                .decode()
+                .rstrip("=")
+            )
+            if not confirm_host(f"{hostname}: {key.get_name()} SHA256:{digest}"):
+                raise RemoteError("SSH host key was not accepted")
+            client.get_host_keys().add(hostname, key.get_name(), key)
+            known_hosts.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary = tempfile.mkstemp(
+                prefix=".known-hosts-", dir=str(known_hosts.parent)
+            )
+            os.close(fd)
+            try:
+                client.save_host_keys(temporary)
+                os.chmod(temporary, 0o600)
+                os.replace(temporary, known_hosts)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+
+    client = paramiko.SSHClient()
+    try:
+        client.load_system_host_keys()
+        if known_hosts.exists():
+            client.load_host_keys(str(known_hosts))
+        client.set_missing_host_key_policy(ConfirmHostKey())
+        client.connect(
+            server["host"],
+            port=int(server.get("port", 22)),
+            username=server.get("user", "root"),
+            password=password,
+            allow_agent=password is None,
+            look_for_keys=password is None,
+            timeout=20,
+            auth_timeout=30,
+            banner_timeout=30,
+        )
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(20)
+        return client
+    except BaseException:
+        client.close()
+        raise
+
+
+_RECOVER_SOURCE = r"""
+import base64, fcntl, json, pathlib
+with open('/run/lock/cdn-xhttp.lock', 'a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    root = pathlib.Path('/etc/cdn-xhttp')
+    if root.is_symlink():
+        raise SystemExit('Managed directory is a symlink')
+    payload = {}
+    for name in ('deployment.json', 'config.json', 'setup.json'):
+        p = root / name
+        if p.is_symlink():
+            raise SystemExit('Managed file is a symlink')
+        if p.exists():
+            if p.stat().st_size > 1048576:
+                raise SystemExit('Managed file is too large')
+            payload[name] = json.loads(p.read_text())
+    if payload and ('deployment.json' not in payload or 'config.json' not in payload):
+        raise SystemExit('Incomplete installation; inspect the VPS before continuing')
+    print('CDN_SETUP:' + base64.b64encode(json.dumps(payload).encode()).decode())
+"""
+
+
+def _recovered_config(payload: dict, server: dict) -> dict | None:
+    """Decode owned v0.2 metadata, or reconstruct the supported v0.1 layout."""
+    from .config import XRAY_VERSION, validate
+    from .render import origin_xray
+
+    if not payload:
+        return None
+    identity = payload["deployment.json"]
+    if identity.get("role") != "origin":
+        raise RemoteError("Enter the origin server, not the exit server")
+    runtime = payload["config.json"]
+    legacy = "setup.json" not in payload
+    if not legacy:
+        c = validate(payload["setup.json"])
+        if c["origin"]["host"] != server["host"]:
+            raise RemoteError("Saved origin IP differs from the connected server")
+        c["origin"] = dict(server)
+    else:
+        try:
+            inbound = runtime["inbounds"][0]
+            xhttp = inbound["streamSettings"]["xhttpSettings"]
+            uuids = [user["id"] for user in inbound["settings"]["users"]]
+            c = {
+                "origin": dict(server),
+                "origin_domain": identity["domain"],
+                "cdn_domain": identity["cdn_domain"],
+                "exit": None,
+                "email": "recovery@example.com",
+                "name": "CDN XHTTP",
+                "uuids": uuids,
+                "uuid": uuids[0],
+                "path": xhttp["path"],
+                "padding_key": xhttp["xPaddingKey"],
+                "profile": "fast",
+                "xray_version": XRAY_VERSION,
+            }
+            outbound = runtime["outbounds"][0]
+            if outbound["protocol"] == "vless":
+                c["exit"] = {
+                    "host": outbound["settings"]["vnext"][0]["address"],
+                    "port": 22,
+                    "user": "root",
+                }
+                c["exit_domain"] = outbound["streamSettings"]["tlsSettings"][
+                    "serverName"
+                ]
+            c = validate(c)
+        except (KeyError, IndexError, TypeError, ValueError):
+            raise RemoteError(
+                "Unsupported legacy configuration; existing settings were preserved"
+            ) from None
+    if identity != json.loads(_identity(c, "origin")) or runtime != origin_xray(c):
+        raise RemoteError(
+            "Server configuration differs from its saved setup; inspect it before changing settings"
+        )
+    if legacy:
+        c["email"] = ""
+        c["_recovered_legacy"] = True
+    return c
+
+
+def recover_config(
+    server: dict,
+    *,
+    password: str | None,
+    sudo_password: str | None,
+    known_hosts: Path,
+    confirm_host: Callable[[str], bool],
+) -> dict | None:
+    """Read an existing installation over verified SSH without changing it."""
+    import paramiko
+
+    client = None
+    try:
+        client = _connect(server, password, known_hosts, confirm_host)
+        command = "python3 -c " + shlex.quote(_RECOVER_SOURCE)
+        sudo_input = None
+        if server.get("user", "root") != "root":
+            command = "sudo -k -S -p '' -- " + command
+            sudo_input = sudo_password
+        lines = []
+
+        def collect(line):
+            if sum(map(len, lines)) + len(line) > 2 * 1024 * 1024:
+                raise RemoteError("Server setup response is too large")
+            lines.append(line)
+
+        _stream_command(
+            client,
+            command,
+            stdin_secret=sudo_input,
+            log=collect,
+            secrets=[],
+            timeout=60,
+        )
+        encoded = [
+            line.removeprefix("CDN_SETUP:")
+            for line in lines
+            if line.startswith("CDN_SETUP:")
+        ]
+        if len(encoded) != 1:
+            raise RemoteError("Server did not return a valid saved setup")
+        return _recovered_config(
+            json.loads(base64.b64decode(encoded[0], validate=True)), server
+        )
+    except paramiko.BadHostKeyException:
+        raise RemoteError(
+            "SSH host key changed. Verify it independently before updating known_hosts."
+        ) from None
+    except paramiko.AuthenticationException:
+        raise RemoteError("SSH authentication failed") from None
+    except RemoteError:
+        raise
+    except (paramiko.SSHException, OSError, EOFError, ValueError, KeyError, TypeError):
+        raise RemoteError(
+            "Unable to recover a supported server setup; existing settings were preserved"
+        ) from None
+    finally:
+        if client is not None:
+            client.close()
 
 
 def _stream_command(
@@ -533,6 +839,7 @@ def deploy_server(
     known_hosts: Path,
     confirm_host: Callable[[str], bool],
     log: Callable[[str], None],
+    previous: dict | None = None,
 ) -> None:
     """Deploy one role; verify or explicitly trust its SSH host fingerprint.
 
@@ -546,7 +853,11 @@ def deploy_server(
         raise RemoteError(
             "Install dependencies first: python -m pip install -e ."
         ) from exc
-    script = render_bootstrap(config, role)
+    script = (
+        render_bootstrap(config, role, previous=previous)
+        if previous
+        else render_bootstrap(config, role)
+    )
     server = config[role]
     known_hosts = Path(known_hosts)
     secrets = [
@@ -556,51 +867,10 @@ def deploy_server(
         sudo_password or "",
     ]
 
-    class ConfirmHostKey(paramiko.MissingHostKeyPolicy):
-        def missing_host_key(self, client, hostname, key):
-            digest = (
-                base64.b64encode(hashlib.sha256(key.asbytes()).digest())
-                .decode()
-                .rstrip("=")
-            )
-            question = f"{hostname}: {key.get_name()} SHA256:{digest}"
-            if not confirm_host(question):
-                raise RemoteError("SSH host key was not accepted")
-            client.get_host_keys().add(hostname, key.get_name(), key)
-            known_hosts.parent.mkdir(parents=True, exist_ok=True)
-            fd, temporary = tempfile.mkstemp(
-                prefix=".known-hosts-", dir=str(known_hosts.parent)
-            )
-            os.close(fd)
-            try:
-                client.save_host_keys(temporary)
-                os.chmod(temporary, 0o600)
-                os.replace(temporary, known_hosts)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-
-    client = paramiko.SSHClient()
+    client = None
     remote_dir = None
     try:
-        client.load_system_host_keys()
-        if known_hosts.exists():
-            client.load_host_keys(str(known_hosts))
-        client.set_missing_host_key_policy(ConfirmHostKey())
-        client.connect(
-            server["host"],
-            port=int(server.get("port", 22)),
-            username=server.get("user", "root"),
-            password=password,
-            allow_agent=password is None,
-            look_for_keys=password is None,
-            timeout=20,
-            auth_timeout=30,
-            banner_timeout=30,
-        )
-        transport = client.get_transport()
-        if transport is not None:
-            transport.set_keepalive(20)
+        client = _connect(server, password, known_hosts, confirm_host)
         stdin, stdout, stderr = client.exec_command(
             "umask 077; mktemp -d /tmp/cdn-xhttp-ssh.XXXXXXXX", timeout=30
         )
@@ -648,4 +918,5 @@ def deploy_server(
                 log(
                     "Remote temporary script cleanup could not be confirmed; remove the private /tmp/cdn-xhttp-ssh.* directory on the VPS."
                 )
-        client.close()
+        if client is not None:
+            client.close()

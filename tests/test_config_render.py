@@ -3,13 +3,13 @@
 import ast
 import copy
 import json
-from pathlib import Path
 import re
 import tempfile
 import unittest
+from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
-from cdn_xhttp.config import domain, load, validate
+from cdn_xhttp.config import domain, load, validate, write_private
 from cdn_xhttp.health import HEALTH_SERVER_SOURCE
 from cdn_xhttp.render import (
     client_xray,
@@ -125,6 +125,44 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 domain(value)
 
+    def test_edge_override_accepts_only_public_ip_and_leaves_domain_contract_intact(
+        self,
+    ):
+        for address in ("1.1.1.1", "2a02:6b8::1"):
+            value = validate(spec(connect_address=address))
+            self.assertEqual(address, value["connect_address"])
+            self.assertEqual("cdn.example.com", value["cdn_domain"])
+        for address in (
+            None,
+            "",
+            "cdn.example.com",
+            "https://1.1.1.1",
+            "127.0.0.1",
+            "10.0.0.1",
+            "192.0.2.1",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+            "2a02:6b8::1%eth0",
+        ):
+            with self.subTest(address=address), self.assertRaises(ValueError):
+                validate(spec(connect_address=address))
+
+    def test_atomic_private_write_does_not_truncate_old_file_if_replace_fails(self):
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "vless.txt"
+            target.write_text("old", encoding="utf-8")
+            with (
+                patch("os.replace", side_effect=OSError("disk error")),
+                self.assertRaises(OSError),
+            ):
+                write_private(target, "new")
+            self.assertEqual("old", target.read_text(encoding="utf-8"))
+            self.assertEqual([target], list(Path(directory).iterdir()))
+
     def test_load_handles_utf8_bom_without_modifying_input(self):
         original = spec()
         before = copy.deepcopy(original)
@@ -181,6 +219,23 @@ class ValidationTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
+    def test_edge_changes_only_connect_target_and_brackets_ipv6_in_uri(self):
+        baseline = validate(spec())
+        for address in ("1.1.1.1", "2a02:6b8::1"):
+            value = validate(spec(connect_address=address))
+            outbound = client_xray(value)["outbounds"][0]
+            self.assertEqual(address, outbound["settings"]["vnext"][0]["address"])
+            self.assertEqual(
+                client_xray(baseline)["outbounds"][0]["streamSettings"],
+                outbound["streamSettings"],
+            )
+            uri = urlsplit(vless_uri(value))
+            self.assertEqual((address, 443), (uri.hostname, uri.port))
+            params = parse_qs(uri.query)
+            self.assertEqual(["cdn.example.com"], params["sni"])
+            self.assertEqual(["cdn.example.com"], params["host"])
+            self.assertEqual(origin_xray(baseline), origin_xray(value))
+
     def test_multiuser_links_select_distinct_authorized_identities(self):
         identities = [
             spec()["uuid"],

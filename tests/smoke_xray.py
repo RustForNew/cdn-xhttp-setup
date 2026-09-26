@@ -338,6 +338,8 @@ def run_case(binary: Path, profile: str, chained: bool, certificate: dict) -> No
             client["inbounds"] = [inbound]
             inbound["listen"] = "127.0.0.1"
             inbound["port"] = client_port
+            # This test exercises TCP; avoid unrelated Windows UDP port exclusions.
+            inbound["settings"]["udp"] = False
             outbound = next(
                 item for item in client["outbounds"] if item["protocol"] == "vless"
             )

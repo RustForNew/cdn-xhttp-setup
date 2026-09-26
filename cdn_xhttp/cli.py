@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import getpass
 import ipaddress
 import json
+import os
 import re
 import socket
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -23,7 +26,7 @@ from .config import (
     validate,
     write_private,
 )
-from .render import client_xray, extra, nginx_config, origin_xray, exit_xray, vless_uri
+from .render import client_xray, exit_xray, extra, nginx_config, origin_xray, vless_uri
 
 
 def ask(label: str, default: str = "") -> str:
@@ -121,7 +124,11 @@ def ask_domain(label: str, used: tuple[str, ...] = ()) -> str:
 
 
 def wizard(
-    path: Path, credentials: dict | None = None, *, replace_existing: bool = False
+    path: Path,
+    credentials: dict | None = None,
+    *,
+    replace_existing: bool = False,
+    origin: dict | None = None,
 ) -> dict:
     if path.is_symlink():
         raise ValueError("Файл конфигурации не должен быть символической ссылкой")
@@ -133,7 +140,8 @@ def wizard(
     print("Без моста нужен один VPS. С мостом — входной VPS и отдельный выходной VPS.")
     bridge = yes("Использовать мост из двух серверов?")
     c = {
-        "origin": ask_server(
+        "origin": origin
+        or ask_server(
             "Входной сервер — принимает подключения от CDN" if bridge else "Сервер",
             credentials,
             "origin",
@@ -169,23 +177,47 @@ def wizard(
     c["profile"] = "fast"
     c["path"] = DEFAULT_PATH
     c = validate(c)
-    if path.exists():
-        index = 1
-        backup = path.with_name(f"{path.stem}.backup-{index}{path.suffix}")
-        while backup.exists() or backup.is_symlink():
-            index += 1
-            backup = path.with_name(f"{path.stem}.backup-{index}{path.suffix}")
-        # Preserve the old file byte-for-byte, including BOM and line endings.
-        import os
-
-        with os.fdopen(
-            os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
-        ) as f:
-            f.write(path.read_bytes())
-        print(f"Прежняя конфигурация сохранена: {backup}")
-    write_private(path, json.dumps(c, indent=2, ensure_ascii=False) + "\n")
+    save_configuration(path, c, backup=path.exists())
     print(f"Параметры сохранены: {path}. Файл содержит UUID доступа, но не SSH-пароли.")
     return c
+
+
+def save_configuration(path: Path, c: dict, *, backup: bool = False) -> None:
+    """Replace a validated local spec atomically, preserving its text encoding."""
+    if path.is_symlink():
+        raise ValueError("Файл конфигурации не должен быть символической ссылкой")
+    c = validate(c)
+    previous = path.read_bytes() if path.exists() else b""
+    newline = "\r\n" if b"\r\n" in previous else "\n"
+    payload = (
+        (json.dumps(c, indent=2, ensure_ascii=False) + "\n")
+        .replace("\n", newline)
+        .encode("utf-8")
+    )
+    if previous.startswith(b"\xef\xbb\xbf"):
+        payload = b"\xef\xbb\xbf" + payload
+    if previous == payload:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if backup and path.exists():
+        index = 1
+        backup_path = path.with_name(f"{path.stem}.backup-{index}{path.suffix}")
+        while backup_path.exists() or backup_path.is_symlink():
+            index += 1
+            backup_path = path.with_name(f"{path.stem}.backup-{index}{path.suffix}")
+        with os.fdopen(
+            os.open(backup_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
+        ) as handle:
+            handle.write(previous)
+        print(f"Прежняя конфигурация сохранена: {backup_path}")
+    descriptor, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def dns_preflight(c: dict) -> None:
@@ -215,8 +247,19 @@ def dns_preflight(c: dict) -> None:
 
 
 def write_connection(
-    c: dict, directory: Path, verified: bool, checks: dict | None = None
+    c: dict,
+    directory: Path,
+    verified: bool,
+    checks: dict | list | None = None,
+    *,
+    vless_verified: bool = False,
+    route: str | None = None,
 ) -> None:
+    if directory.is_symlink():
+        raise ValueError("Папка результата не должна быть символической ссылкой")
+    clients_dir = directory / "clients"
+    if clients_dir.is_symlink():
+        raise ValueError("Папка clients не должна быть символической ссылкой")
     directory.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
         directory.chmod(0o700)
@@ -229,9 +272,6 @@ def write_connection(
     write_private(
         directory / "client.json", json.dumps(client_xray(c), indent=2) + "\n"
     )
-    clients_dir = directory / "clients"
-    if clients_dir.is_symlink():
-        raise ValueError("Папка clients не должна быть символической ссылкой")
     expected_clients = (
         {f"client-{index + 1:03d}.json" for index in range(count)}
         if count > 1
@@ -259,8 +299,14 @@ def write_connection(
         json.dumps(
             {
                 "endpoint_verified": verified,
-                "vless_tunnel_verified": False,
-                "note": "Endpoint check tests TLS and OPTIONS body forwarding, not authenticated VLESS tunnel or speed.",
+                "vless_tunnel_verified": vless_verified,
+                "connect_address": c.get("connect_address"),
+                "route": route,
+                "note": (
+                    "Authenticated VLESS/XHTTP transfer verified from this computer; availability can change."
+                    if vless_verified
+                    else "Offline preview; authenticated VLESS tunnel is not verified."
+                ),
                 "checks": checks,
             },
             indent=2,
@@ -271,16 +317,62 @@ def write_connection(
 
 
 def check(c: dict) -> dict:
-    from .health import check_endpoint
+    from .edge import select_edge
 
-    checks = {}
-    for name in ("origin", "cdn"):
-        host = c[f"{name}_domain"]
-        print(f"Проверка HTTPS + OPTIONS с телом: {host} ...", flush=True)
-        result = check_endpoint(host, max_bytes=1000000)
-        checks[name] = result
-        print("  OK" if result["ok"] else "  ОШИБКА: " + "; ".join(result["errors"]))
-    return checks
+    return select_edge(c, log=lambda message: print(message, flush=True))
+
+
+def issue_connections(c: dict, args: argparse.Namespace) -> int:
+    from .edge import EdgeSelectionError
+
+    print(
+        "Подбираем CDN Edge: сначала Ethernet, затем обычный маршрут. Проверяем полный VLESS/XHTTP-путь."
+    )
+    try:
+        result = check(c)
+        if (
+            result.get("endpoint_verified") is not True
+            or result.get("vless_tunnel_verified") is not True
+        ):
+            raise EdgeSelectionError("Полный VPN-путь не подтверждён")
+        selected = validate({**c, "connect_address": result["connect_address"]})
+    except EdgeSelectionError as exc:
+        write_private(
+            args.output / "status.json",
+            json.dumps(
+                {
+                    "endpoint_verified": False,
+                    "vless_tunnel_verified": False,
+                    "note": "Current verification failed; earlier connection files, if any, were not replaced.",
+                },
+                indent=2,
+            )
+            + "\n",
+        )
+        print(
+            f"CDN не подтверждён: {exc}. Новые ссылки не выданы; прежние файлы сохранены."
+        )
+        return 2
+    write_connection(
+        selected,
+        args.output,
+        True,
+        result.get("checks"),
+        vless_verified=True,
+        route=result.get("route"),
+    )
+    previous_local = load(args.config) if args.config.exists() else None
+    replaced_setup = previous_local is not None and {
+        key: value for key, value in previous_local.items() if key != "connect_address"
+    } != {key: value for key, value in selected.items() if key != "connect_address"}
+    save_configuration(args.config, selected, backup=replaced_setup)
+    print(
+        f"Полный VPN-путь проверен. Edge: {selected['connect_address']}; маршрут: {result.get('route', 'unknown')}."
+    )
+    for index in range(len(selected["uuids"])):
+        print(vless_uri(selected, index=index))
+    print(f"Ссылки, клиентские конфиги и результат проверки: {args.output.resolve()}")
+    return 0
 
 
 def show_summary(c: dict) -> None:
@@ -308,7 +400,48 @@ def redact(text: str, credentials: dict) -> str:
     return text
 
 
-def deploy(c: dict, args: argparse.Namespace, credentials: dict | None = None) -> int:
+def pending_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}.pending{path.suffix}")
+
+
+def read_pending(path: Path) -> tuple[dict, dict] | None:
+    pending = pending_path(path)
+    if pending.is_symlink():
+        raise ValueError(
+            "Файл незавершённого изменения не должен быть символической ссылкой"
+        )
+    if not pending.exists():
+        return None
+    value = json.loads(pending.read_text(encoding="utf-8-sig"))
+    if not isinstance(value, dict) or set(value) != {"target", "previous"}:
+        raise ValueError("Некорректный файл незавершённого изменения")
+    return validate(value["target"]), validate(value["previous"])
+
+
+def stage_pending(path: Path, c: dict, previous: dict) -> None:
+    target, old = validate(c), validate(previous)
+    existing = read_pending(path)
+    if existing is not None and existing != (target, old):
+        raise ValueError(
+            "Есть другое незавершённое изменение. Продолжите его через пункт 6 меню управления"
+        )
+    if existing is None:
+        write_private(
+            pending_path(path),
+            json.dumps(
+                {"target": target, "previous": old}, indent=2, ensure_ascii=False
+            )
+            + "\n",
+        )
+
+
+def deploy(
+    c: dict,
+    args: argparse.Namespace,
+    credentials: dict | None = None,
+    *,
+    previous: dict | None = None,
+) -> int:
     from .remote import deploy_server
 
     credentials = credentials if credentials is not None else {}
@@ -328,6 +461,8 @@ def deploy(c: dict, args: argparse.Namespace, credentials: dict | None = None) -
         if c.get(role) and role not in credentials:
             credentials[role] = ask_credentials(c[role])
     dns_preflight(c)
+    if previous is not None:
+        stage_pending(args.config, c, previous)
     for role in ("exit", "origin"):
         s = c.get(role)
         if not s:
@@ -344,26 +479,22 @@ def deploy(c: dict, args: argparse.Namespace, credentials: dict | None = None) -
                     + "\nСверьте fingerprint с консолью VPS. Доверять этому ключу?"
                 ),
                 log=lambda text: print(redact(text, credentials), flush=True),
+                **({"previous": previous} if previous is not None else {}),
             )
         except Exception as exc:
+            if previous is not None:
+                print(
+                    "Изменение выполнено не полностью. Прежний локальный конфиг сохранён; для продолжения с теми же UUID выберите пункт 6 меню управления."
+                )
             raise RuntimeError(redact(str(exc), credentials)) from None
-    checks = check(c)
-    verified = all(item["ok"] for item in checks.values())
-    write_connection(c, args.output, verified, checks)
-    if verified:
-        print(
-            "\nVPS настроен; TLS и передача OPTIONS через CDN проверены. VLESS-туннель и скорость проверьте клиентом."
-        )
-        for index in range(len(c.get("uuids", [c["uuid"]]))):
-            print(vless_uri(c, index=index))
-    else:
-        print(
-            "\nVPS настроен, но проверка endpoint не пройдена. Проверьте CDN/DNS и повторите команду check. Работоспособность ссылки пока не подтверждена."
-        )
+    # Server state is now authoritative even when the following network check fails.
+    save_configuration(args.config, c, backup=previous is not None)
+    if previous is not None:
+        pending_path(args.config).unlink()
     print(
-        f"Ссылка, XHTTP extra, полный клиентский конфиг и статус: {args.output.resolve()}"
+        "\nСерверные настройки применены. Проверяем подключение перед выдачей ссылок."
     )
-    return 0 if verified else 2
+    return issue_connections(c, args)
 
 
 def plan(c: dict, directory: Path) -> None:
@@ -381,19 +512,242 @@ def plan(c: dict, directory: Path) -> None:
         )
     write_private(directory / "nginx.conf", nginx_config(c))
     write_connection(c, directory, False)
-    print(f"План без SSH и изменений на серверах: {directory.resolve()}")
+    print(
+        f"Непроверенный план без SSH и изменений на серверах: {directory.resolve()}. Ссылки в плане — только для просмотра."
+    )
 
 
 def existing_action(path: Path) -> str:
-    print(f"Найдена сохранённая конфигурация: {path}")
-    print("1 — Продолжить установку с сохранёнными настройками и UUID")
-    print("2 — Настроить заново (прежний файл сохранится в резервной копии)")
-    print("3 — Выход")
+    print(f"Управление настройками: {path}")
+    print("1 — Проверить / переподобрать Edge и выдать ссылки с прежними UUID")
+    print("2 — Изменить количество доступов (UUID)")
+    print("3 — Изменить домены, название и параметры подключения")
+    print("4 — Повторить установку с сохранёнными настройками")
+    print("5 — Подключиться к другому origin по SSH")
+    if pending_path(path).exists():
+        print("6 — Продолжить незавершённое изменение с прежними UUID")
+    print("0 — Выход")
     while True:
         choice = ask("Выберите действие", "1")
-        if choice in {"1", "2", "3"}:
+        if choice in {"0", "1", "2", "3", "4", "5"} or (
+            choice == "6" and pending_path(path).exists()
+        ):
             return choice
-        print("Введите 1, 2 или 3.")
+        print("Введите число от 0 до 5.")
+
+
+def recover(
+    server_spec: dict, args: argparse.Namespace, credentials: dict
+) -> dict | None:
+    from .remote import recover_config
+
+    if "origin" not in credentials:
+        credentials["origin"] = ask_credentials(server_spec)
+    return recover_config(
+        server_spec,
+        password=credentials["origin"]["password"],
+        sudo_password=credentials["origin"]["sudo_password"],
+        known_hosts=args.known_hosts,
+        confirm_host=lambda message: yes(
+            message + "\nСверьте fingerprint с консолью VPS. Доверять этому ключу?"
+        ),
+    )
+
+
+def complete_recovered(raw: dict, local: dict | None = None) -> dict:
+    c = copy.deepcopy(raw)
+    legacy = c.pop("_recovered_legacy", False)
+    if legacy:
+        print(
+            "Найдена установка старой версии. UUID и серверные параметры восстановлены; email, название и профиль в старой серверной копии не сохранялись."
+        )
+        c["email"] = ask_validated(
+            "Email для выпуска сертификата Let's Encrypt",
+            certificate_email,
+            local["email"] if local else "",
+        )
+        c["name"] = local["name"] if local else "CDN XHTTP"
+        c["profile"] = local["profile"] if local else "fast"
+        print(
+            f"Профиль: {c['profile']}. Его и название можно изменить в меню параметров."
+        )
+        if c.get("exit"):
+            saved = local.get("exit") if local else None
+            defaults = (
+                saved if saved and saved["host"] == c["exit"]["host"] else c["exit"]
+            )
+            print(f"Проверьте SSH-доступ к восстановленному exit {c['exit']['host']}.")
+            c["exit"]["user"] = ask_validated(
+                "SSH-логин exit",
+                lambda value: server({**c["exit"], "user": value})["user"],
+                defaults.get("user", "root"),
+            )
+            c["exit"]["port"] = ask_validated(
+                "SSH-порт exit",
+                lambda value: number(value, 1, 65535),
+                str(defaults.get("port", 22)),
+            )
+    return validate(c)
+
+
+def refresh_config(c: dict, args: argparse.Namespace, credentials: dict) -> dict:
+    """Use the authorized identities on the server before exporting local links."""
+    try:
+        raw = recover(c["origin"], args, credentials)
+        if raw is None:
+            raise ValueError(
+                "Установка программы на origin не найдена; список действующих UUID не подтверждён"
+            )
+        current = complete_recovered(raw, c)
+        if c.get("connect_address") and c["cdn_domain"] == current["cdn_domain"]:
+            current["connect_address"] = c["connect_address"]
+        return current
+    except BaseException:
+        # A cancelled SSH read also invalidates this attempt, not the old link files.
+        # Never serialize exception text: remote failures may contain credentials.
+        try:
+            if args.output.is_symlink():
+                raise ValueError(
+                    "Папка результата не должна быть символической ссылкой"
+                )
+            write_private(
+                args.output / "status.json",
+                json.dumps(
+                    {
+                        "endpoint_verified": False,
+                        "vless_tunnel_verified": False,
+                        "note": "Current server configuration could not be verified; earlier connection files, if any, were not replaced.",
+                    },
+                    indent=2,
+                )
+                + "\n",
+            )
+        except (OSError, ValueError):
+            # Preserve the original failure when the output is not writable.
+            pass
+        raise
+
+
+def change_count(c: dict) -> dict:
+    updated = copy.deepcopy(c)
+    old_count = len(c["uuids"])
+    count = ask_validated(
+        "Количество доступов (1–1000)",
+        lambda value: number(value, 1, 1000),
+        str(old_count),
+    )
+    if count < old_count:
+        print(
+            f"Будут отозваны последние {old_count - count} доступов: номера {count + 1}–{old_count}. Первые {count} UUID сохранятся."
+        )
+        if not yes("Применить уменьшение количества доступов?"):
+            return c
+    updated["uuids"] = c["uuids"][:count] + [
+        str(uuid.uuid4()) for _ in range(max(0, count - old_count))
+    ]
+    updated["uuid"] = updated["uuids"][0]
+    return validate(updated)
+
+
+def change_settings(c: dict) -> dict:
+    updated = copy.deepcopy(c)
+    print(
+        "Enter сохраняет прежнее значение. DNS и ресурс CDN изменяются в панели провайдера отдельно."
+    )
+    for key, label in (
+        ("origin_domain", "Домен origin"),
+        ("cdn_domain", "CDN-домен клиентов"),
+        ("exit_domain", "Домен exit"),
+    ):
+        if key == "exit_domain" and not c.get("exit"):
+            continue
+
+        def checked_domain(value, field=key):
+            normalized = domain(value)
+            validate({**updated, field: normalized})
+            return normalized
+
+        updated[key] = ask_validated(label, checked_domain, updated[key])
+    updated["name"] = ask_validated("Название ссылок", connection_name, updated["name"])
+    updated["email"] = ask_validated(
+        "Email для сертификата", certificate_email, updated["email"]
+    )
+    for key, label in (
+        ("profile", "Профиль (fast/original)"),
+        ("path", "Путь XHTTP"),
+        ("padding_key", "Ключ padding"),
+    ):
+
+        def checked_field(value, field=key):
+            return validate({**updated, field: value})[field]
+
+        updated[key] = ask_validated(label, checked_field, updated[key])
+    if any(updated[key] != c[key] for key in ("origin_domain", "cdn_domain")):
+        updated.pop("connect_address", None)
+        print(
+            "Обновите DNS, сертификат CDN и Origin/Host/SNI ресурса CDN под новые домены. Без этого проверка туннеля может не пройти."
+        )
+    return validate(updated)
+
+
+def manage(
+    c: dict, args: argparse.Namespace, credentials: dict, *, recovered: bool = False
+) -> int:
+    show_summary(c)
+    choice = existing_action(args.config)
+    if choice == "0":
+        return 0
+    if choice == "1":
+        current = c if recovered else refresh_config(c, args, credentials)
+        return issue_connections(current, args)
+    if choice == "6":
+        pending = read_pending(args.config)
+        if pending is None:
+            raise ValueError("Незавершённое изменение не найдено")
+        target, previous = pending
+        return deploy(target, args, credentials, previous=previous)
+    if choice == "5":
+        # A different host must not inherit the previous host's password.
+        for item in credentials.values():
+            item.clear()
+        credentials.clear()
+        return connect_wizard(args, credentials)
+    previous = c if recovered else None
+    if not recovered:
+        raw = recover(c["origin"], args, credentials)
+        if raw is not None:
+            previous = complete_recovered(raw, c)
+    if choice in {"2", "3"}:
+        if previous is None:
+            raise ValueError(
+                "Установка программы на origin не найдена. Выберите повторную установку для сохранённых настроек"
+            )
+        c = change_count(previous) if choice == "2" else change_settings(previous)
+        if c == previous:
+            print("Настройки не изменились.")
+            return 0
+    elif previous is not None:
+        # Reinstall the current server state, never stale local credentials.
+        c = previous
+    return deploy(c, args, credentials, previous=previous)
+
+
+def connect_wizard(args: argparse.Namespace, credentials: dict) -> int:
+    if read_pending(args.config) is not None:
+        raise ValueError(
+            "Сначала продолжите незавершённое изменение через пункт 6 или задайте отдельный --config для другого сервера"
+        )
+    print("CDN XHTTP Setup — подключение к origin и поиск сохранённой установки")
+    origin = ask_server("Origin — сервер, принимающий подключения от CDN", credentials)
+    raw = recover(origin, args, credentials)
+    if raw is not None:
+        print("Найдена установка CDN XHTTP Setup. Существующие UUID сохранены.")
+        return manage(complete_recovered(raw), args, credentials, recovered=True)
+    print("Сохранённая установка не найдена. Настроим новый сервер.")
+    c = wizard(
+        args.config, credentials, replace_existing=args.config.exists(), origin=origin
+    )
+    return deploy(c, args, credentials)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -403,7 +757,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["wizard", "deploy", "plan", "check", "link"],
+        choices=["wizard", "manage", "deploy", "plan", "check", "link", "repair-edge"],
         default="wizard",
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -418,33 +772,31 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     credentials: dict = {}
     try:
-        if args.command == "wizard":
-            action = existing_action(args.config) if args.config.exists() else "2"
-            if action == "3":
-                return 0
-            c = (
-                load(args.config)
-                if action == "1"
-                else wizard(
-                    args.config, credentials, replace_existing=args.config.exists()
-                )
-            )
-        else:
-            c = load(args.config)
-        if args.command in {"wizard", "deploy"}:
-            return deploy(c, args, credentials)
+        if args.command in {"wizard", "manage"}:
+            if args.config.exists():
+                return manage(load(args.config), args, credentials)
+            pending = read_pending(args.config)
+            if pending is not None:
+                # Recovery from SSH can fail mid-update before a local main spec exists.
+                return manage(pending[1], args, credentials)
+            return connect_wizard(args, credentials)
+        c = load(args.config)
+        if args.command == "deploy":
+            raw = recover(c["origin"], args, credentials)
+            previous = complete_recovered(raw, c) if raw is not None else None
+            if previous is not None:
+                if previous.get("exit") and c["uuid"] != previous["uuid"]:
+                    raise ValueError(
+                        "Первый UUID существующего моста должен сохраняться"
+                    )
+                removed = set(previous["uuids"]) - set(c["uuids"])
+                if removed:
+                    print(f"Настройки удалят {len(removed)} существующих доступов.")
+            return deploy(c, args, credentials, previous=previous)
         if args.command == "plan":
             plan(c, args.output)
-        elif args.command == "check":
-            checks = check(c)
-            verified = all(x["ok"] for x in checks.values())
-            write_connection(c, args.output, verified, checks)
-            return 0 if verified else 2
-        elif args.command == "link":
-            write_connection(c, args.output, False)
-            print("Ссылка сформирована без проверки доступности:")
-            for index in range(len(c.get("uuids", [c["uuid"]]))):
-                print(vless_uri(c, index=index))
+        elif args.command in {"check", "link", "repair-edge"}:
+            return issue_connections(refresh_config(c, args, credentials), args)
         return 0
     except (KeyboardInterrupt, EOFError):
         print(

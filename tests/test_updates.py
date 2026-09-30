@@ -1,6 +1,7 @@
 """Release integrity, lossless migration and failure isolation without Internet/SSH."""
 
 import hashlib
+import inspect
 import io
 import json
 import stat
@@ -138,6 +139,44 @@ def test_untrusted_download_and_redirect_sources_rejected(url):
     assert not updates._official_url(url)
     with pytest.raises(updates.UpdateError):
         updates._OfficialRedirect().redirect_request(None, None, 302, "", {}, url)
+
+
+def test_release_check_allows_slow_github_with_bounded_fifteen_second_budget(
+    monkeypatch,
+):
+    calls = []
+
+    def fetch(url, maximum, **kwargs):
+        calls.append((url, maximum, kwargs))
+        return json.dumps(
+            {"tag_name": "v0.3.0", "draft": False, "prerelease": False}
+        ).encode()
+
+    monkeypatch.setattr(updates, "_fetch", fetch)
+    assert updates.latest_release("0.3.0") is None
+    assert updates.CHECK_SECONDS == 15.0
+    assert (
+        inspect.signature(updates.check_bounded).parameters["seconds"].default == 15.0
+    )
+    assert calls == [
+        (updates.API_URL, 1024 * 1024, {"timeout": 10.0, "deadline": 15.0})
+    ]
+
+
+def test_update_check_announces_wait_before_starting_network(monkeypatch):
+    events = []
+
+    def check(current):
+        events.append("network")
+        return None, False
+
+    monkeypatch.setattr(updates, "check_bounded", check)
+    assert not updates.offer_update(
+        "0.3.0", confirm=lambda prompt: pytest.fail("offline"), log=events.append
+    )
+    assert events[0] == "Проверяем обновления… Это может занять до 15 секунд."
+    assert events[1] == "network"
+    assert "Текущая версия остаётся доступной" in events[2]
 
 
 def test_check_has_wall_clock_timeout_even_when_dns_stalls(monkeypatch):

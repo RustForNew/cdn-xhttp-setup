@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cdn-xhttp-setup"
-version = "0.3.0"
+version = "0.3.1"
 description = "Configure Ubuntu 22.04/24.04 VPS for VLESS XHTTP through an existing CDN"
 readme = "README.md"
 license = {text = "MIT"}

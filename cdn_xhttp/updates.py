@@ -24,7 +24,7 @@ import zipfile
 REPOSITORY = "RustForNew/cdn-xhttp-setup"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases"
 API_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
-CHECK_SECONDS = 3.0
+CHECK_SECONDS = 15.0
 MANIFEST = "release-manifest.json"
 MAX_ARCHIVE = 32 * 1024 * 1024
 MAX_EXPANDED = 128 * 1024 * 1024
@@ -167,7 +167,9 @@ def _fetch(
 
 def latest_release(current: str) -> Release | None:
     """Only release metadata is read; never trust asset URLs from that metadata."""
-    data = json.loads(_fetch(API_URL, 1024 * 1024, timeout=2.0, deadline=CHECK_SECONDS))
+    data = json.loads(
+        _fetch(API_URL, 1024 * 1024, timeout=10.0, deadline=CHECK_SECONDS)
+    )
     if (
         not isinstance(data, dict)
         or data.get("draft") is not False
@@ -575,6 +577,7 @@ def offer_update(
     log=print,
 ) -> bool:
     """True means an update was installed: stop this old CLI before any SSH work."""
+    log("Проверяем обновления… Это может занять до 15 секунд.")
     release, checked = check_bounded(current)
     if not checked:
         if explicit:

@@ -15,7 +15,7 @@
 
 ## Как запустить
 
-**1. Скачайте архив `cdn-xhttp-setup-vX.Y.Z.zip` из Assets [последнего выпуска](https://github.com/RustForNew/cdn-xhttp-setup/releases/latest)** и распакуйте его. Для версии 0.3.0 файл называется `cdn-xhttp-setup-v0.3.0.zip`.
+**1. Скачайте архив `cdn-xhttp-setup-vX.Y.Z.zip` из Assets [последнего выпуска](https://github.com/RustForNew/cdn-xhttp-setup/releases/latest)** и распакуйте его. Для версии 0.3.1 файл называется `cdn-xhttp-setup-v0.3.1.zip`.
 
 **2. Откройте терминал в распакованной папке.**
 

@@ -69,6 +69,7 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaises(ProbeError):
             edge.parse_prefixes(b" " * (edge.MAX_PREFIX_BYTES + 1))
 
+    @patch.object(edge, "YANDEX_CANDIDATES", ())
     def test_previous_and_dns_precede_interleaved_prefix_hosts(self):
         networks = [
             ipaddress.ip_network("8.8.8.0/29"),
@@ -85,6 +86,7 @@ class CandidateTests(unittest.TestCase):
         self.assertNotIn("8.8.8.7", addresses)
         self.assertEqual(len(addresses), len(set(addresses)))
 
+    @patch.object(edge, "YANDEX_CANDIDATES", ())
     def test_large_networks_are_sampled_with_a_hard_address_limit(self):
         networks = [ipaddress.ip_network("8.0.0.0/8")]
         self.assertLessEqual(len(edge.candidate_addresses(None, [], networks)), 8)
@@ -94,10 +96,29 @@ class CandidateTests(unittest.TestCase):
         )
 
 
+    def test_bundled_candidates_survive_missing_feed_and_duplicate_dns(self):
+        candidates = edge.candidate_addresses(
+            "188.72.110.3", ["188.72.103.107", "188.72.110.3"], []
+        )
+        self.assertEqual(["188.72.110.3", "188.72.103.107"], candidates[:2])
+        self.assertEqual(53, len(candidates))
+        self.assertEqual(set(edge.YANDEX_CANDIDATES), set(candidates))
+        for address in candidates:
+            self.assertTrue(ipaddress.IPv4Address(address).is_global)
+
+    def test_bundled_candidates_are_not_dropped_by_prefix_limit(self):
+        networks = [ipaddress.ip_network(f"11.{index}.0.0/16") for index in range(256)]
+        candidates = edge.candidate_addresses("1.1.1.1", ["8.8.8.8"], networks)
+        self.assertEqual(edge.MAX_CANDIDATES, len(candidates))
+        self.assertEqual(list(edge.YANDEX_CANDIDATES), candidates[2:55])
+        self.assertEqual(len(candidates), len(set(candidates)))
+
+
 class SelectionTests(unittest.TestCase):
     def setUp(self):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(edge, "YANDEX_CANDIDATES", ()))
         self.stack.enter_context(
             patch.object(
                 edge, "_prefix_reference", return_value=([], b"public reference")

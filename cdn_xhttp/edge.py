@@ -23,6 +23,63 @@ from .edge_network import Route, TCPRelay, connect_route, ethernet_routes
 from .edge_runtime import ProbeError, XrayRuntime, options_probe, request_https
 
 PREFIX_URL = "https://tech.cdn.yandex.net/prefixes/yc.json"
+# Additional discovery candidates, not trusted or pre-approved endpoints.
+# Keep these ahead of sampled prefixes so the candidate cap cannot exclude them.
+YANDEX_CANDIDATES = (
+    "188.72.103.107",
+    "188.72.103.102",
+    "188.72.103.112",
+    "188.72.103.115",
+    "188.72.103.106",
+    "188.72.103.111",
+    "188.72.103.109",
+    "188.72.103.108",
+    "188.72.103.118",
+    "188.72.103.110",
+    "188.72.103.113",
+    "188.72.103.105",
+    "188.72.103.126",
+    "188.72.103.114",
+    "188.72.103.119",
+    "188.72.103.117",
+    "188.72.103.121",
+    "188.72.103.125",
+    "188.72.103.124",
+    "188.72.103.128",
+    "188.72.103.127",
+    "188.72.103.101",
+    "188.72.103.103",
+    "188.72.103.116",
+    "188.72.103.188",
+    "188.72.110.17",
+    "188.72.110.18",
+    "188.72.110.23",
+    "188.72.110.24",
+    "188.72.110.34",
+    "188.72.110.3",
+    "188.72.110.35",
+    "188.72.110.36",
+    "188.72.110.4",
+    "188.72.110.52",
+    "188.72.110.5",
+    "188.72.110.50",
+    "188.72.110.51",
+    "188.72.110.6",
+    "188.72.111.18",
+    "188.72.111.19",
+    "188.72.111.20",
+    "188.72.111.2",
+    "188.72.111.21",
+    "188.72.111.36",
+    "188.72.111.37",
+    "188.72.111.35",
+    "188.72.111.3",
+    "188.72.111.52",
+    "188.72.111.51",
+    "188.72.111.50",
+    "188.72.111.7",
+    "188.72.111.8",
+)
 MAX_PREFIX_BYTES = 1024 * 1024
 MAX_PREFIXES = 2048
 MAX_CANDIDATES = 256
@@ -87,7 +144,8 @@ def candidate_addresses(
 ) -> list[str]:
     """Sample offsets across prefixes, not an exhaustive subnet scan.
 
-    One address from each small prefix is tried before another address of the
+    Saved/DNS addresses precede the bundled candidates. Then one address
+    from each small prefix is tried before another address of the
     same prefix. Prefer offset 3, then 2/1/4; /31 and /32 have their own valid
     host semantics. No giant network is expanded into a Python list.
     """
@@ -103,6 +161,8 @@ def candidate_addresses(
     if previous:
         add(previous)
     for address in current[:32]:
+        add(address)
+    for address in YANDEX_CANDIDATES:
         add(address)
     networks = sorted(
         set(networks), key=lambda net: (net.num_addresses, int(net.network_address))
@@ -271,7 +331,7 @@ def select_edge(c: dict, *, log=print) -> dict:
         networks, reference = _prefix_reference()
     except (OSError, http.client.HTTPException, ProbeError, ValueError):
         networks = []
-        log("Список edge временно недоступен; проверяем сохранённый адрес и DNS CDN.")
+        log("Список диапазонов edge временно недоступен; проверяем сохранённый адрес, DNS CDN и встроенные кандидаты.")
     candidates = candidate_addresses(
         config.get("connect_address"), _current_dns(config["cdn_domain"]), networks
     )

@@ -757,13 +757,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["wizard", "manage", "deploy", "plan", "check", "link", "repair-edge"],
+        choices=["wizard", "manage", "deploy", "plan", "check", "link", "repair-edge", "update"],
         default="wizard",
     )
     parser.add_argument("--version", action="version", version=__version__)
     parser.add_argument("--config", type=Path, default=Path("deployment.json"))
     parser.add_argument("--output", type=Path, default=Path("result"))
     parser.add_argument("--known-hosts", type=Path, default=Path("known_hosts"))
+    parser.add_argument(
+        "--no-update-check", action="store_true",
+        help="Пропустить проверку новой версии при интерактивном запуске",
+    )
     parser.add_argument(
         "--yes",
         action="store_true",
@@ -772,6 +776,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     credentials: dict = {}
     try:
+        if args.command == "update" or (
+            args.command in {"wizard", "manage"}
+            and not args.no_update_check and not args.yes
+            and sys.stdin.isatty() and sys.stdout.isatty()
+        ):
+            from .updates import offer_update
+
+            installed = offer_update(__version__, confirm=yes, explicit=args.command == "update")
+            if installed or args.command == "update":
+                return 0
         if args.command in {"wizard", "manage"}:
             if args.config.exists():
                 return manage(load(args.config), args, credentials)

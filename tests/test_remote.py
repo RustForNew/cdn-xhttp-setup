@@ -426,8 +426,8 @@ def test_recovery_of_an_earlier_release_migrates_and_flags_reinstall(config):
     from cdn_xhttp.render import previous_origin_xray
 
     c = validate(config)
-    # setup.json written by 0.3.x pinned Xray 26.5.9.
-    saved = {**c, "xray_version": "26.5.9"}
+    # setup.json written by 0.3.x: pinned 26.5.9 and a selected edge address.
+    saved = {**c, "xray_version": "26.5.9", "connect_address": "198.51.100.7"}
     payload = {
         "deployment.json": json.loads(remote._identity(c, "origin")),
         "config.json": previous_origin_xray(c),
@@ -437,6 +437,7 @@ def test_recovery_of_an_earlier_release_migrates_and_flags_reinstall(config):
     assert recovered.pop("_server_outdated") is True
     assert recovered == c
     assert recovered["xray_version"] == XRAY_VERSION
+    assert "connect_address" not in recovered
 
 
 @pytest.mark.parametrize("layout", ["previous_release", "current"])

@@ -99,21 +99,9 @@ def validate(value: dict) -> dict:
     c["origin"] = server(c["origin"])
     for key in ("origin_domain", "cdn_domain"):
         c[key] = domain(c[key])
-    if "connect_address" in c:
-        value = c["connect_address"]
-        if not isinstance(value, str) or "%" in value:
-            raise ValueError(
-                "connect_address должен быть публичным IP без зоны интерфейса"
-            )
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as exc:
-            raise ValueError(
-                "connect_address должен быть публичным IPv4 или IPv6"
-            ) from exc
-        if not address.is_global or address.is_multicast or address.is_reserved:
-            raise ValueError("connect_address должен быть публичным IPv4 или IPv6")
-        c["connect_address"] = str(address)
+    # Releases 0.2.0-0.3.1 saved a selected CDN edge IP. Clients now always
+    # connect to the CDN domain; the obsolete field is accepted and dropped.
+    c.pop("connect_address", None)
     if c["origin_domain"] == c["cdn_domain"]:
         raise ValueError("Origin и CDN должны иметь разные домены")
     c["email"] = certificate_email(c.get("email", ""))

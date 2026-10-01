@@ -12,6 +12,7 @@ import os
 import platform
 import re
 import secrets
+import shutil
 import socket
 import ssl
 import struct
@@ -75,7 +76,7 @@ def request_https(
                 "Accept-Encoding": "identity",
                 "Cache-Control": "no-store",
                 "Connection": "close",
-                "User-Agent": "CDN-XHTTP-Setup/edge-check",
+                "User-Agent": "CDN-XHTTP-Setup/check",
                 **(
                     {
                         "Content-Type": "application/octet-stream",
@@ -195,15 +196,19 @@ def checksum_sha256(data: bytes) -> str:
 
 
 class XrayRuntime:
-    """Download once per selection; cache only in a random private temp folder.
+    """Download once per check; cache only in a random private temp folder.
 
     No executable is taken from PATH or another installation. The archive is
-    verified before extracting only its executable, which is reused unchanged
-    for candidate tests. The complete directory is removed when selection ends.
+    verified before extracting only its executable. The complete directory is
+    removed when the check ends.
     """
 
     def __enter__(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="cdn-xhttp-edge-")
+        # Antivirus software on Windows can hold xray.exe briefly after the
+        # process exits; a failed cleanup must never mask the check result.
+        self.temporary = tempfile.TemporaryDirectory(
+            prefix="cdn-xhttp-check-", ignore_cleanup_errors=True
+        )
         self.directory = Path(self.temporary.name)
         if os.name != "nt":
             self.directory.chmod(0o700)
@@ -237,7 +242,12 @@ class XrayRuntime:
         return binary
 
     @contextlib.contextmanager
-    def tunnel(self, config: dict, relay_port: int):
+    def tunnel(self, config: dict):
+        """Run the published client profile unchanged except for its inbound.
+
+        The outbound connects to the CDN domain on port 443 through the
+        ordinary system resolver and route, exactly like a client app.
+        """
         binary = self.prepare()
         user, password = secrets.token_hex(12), secrets.token_hex(24)
         with socket.socket() as reservation:
@@ -257,8 +267,6 @@ class XrayRuntime:
                 },
             }
         ]
-        target = profile["outbounds"][0]["settings"]["vnext"][0]
-        target["address"], target["port"] = "127.0.0.1", relay_port
         path = self.directory / "probe.json"
         write_private(path, json.dumps(profile))
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
@@ -308,6 +316,13 @@ class XrayRuntime:
                 path.unlink()
 
     def __exit__(self, *exc):
+        for attempt in range(5):
+            if attempt:
+                time.sleep(0.2 * attempt)
+            shutil.rmtree(self.directory, ignore_errors=True)
+            if not self.directory.exists():
+                break
+        # Detach the finalizer; a still locked file is left behind silently.
         self.temporary.cleanup()
 
 

@@ -216,13 +216,19 @@ class WizardTests(unittest.TestCase):
             self.assertEqual("existing data", target.read_text(encoding="utf-8"))
 
 
-def edge_result():
+def verified_result():
     return {
-        "connect_address": "1.1.1.1",
         "endpoint_verified": True,
         "vless_tunnel_verified": True,
-        "route": "ethernet",
-        "checks": [{"ok": True}],
+        "checks": [{"name": "vless_tunnel", "ok": True}],
+    }
+
+
+def failed_result():
+    return {
+        "endpoint_verified": False,
+        "vless_tunnel_verified": False,
+        "checks": [{"name": "vless_tunnel", "ok": False, "error": "timeout"}],
     }
 
 
@@ -261,7 +267,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch("builtins.input", side_effect=answer),
                 patch("getpass.getpass", return_value="example-secret") as password,
                 patch.object(cli, "recover", side_effect=recovery),
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 patch("cdn_xhttp.remote.deploy_server") as deploy,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
@@ -290,7 +296,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch.object(cli, "recover", return_value=None),
                 patch.object(cli, "dns_preflight"),
                 patch("cdn_xhttp.remote.deploy_server", side_effect=deploy_server),
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 contextlib.redirect_stdout(output),
                 contextlib.redirect_stderr(errors),
             ):
@@ -301,7 +307,7 @@ class InstallationFlowTests(unittest.TestCase):
                 received,
             )
             saved = load(base / "deployment.json")
-            self.assertEqual("1.1.1.1", saved["connect_address"])
+            self.assertNotIn("connect_address", saved)
             check = json.loads(
                 (base / "result" / "status.json").read_text(encoding="utf-8")
             )
@@ -325,7 +331,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch("builtins.input", return_value=""),
                 patch("getpass.getpass") as password,
                 patch.object(cli, "recover", return_value=value) as recover,
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 patch("cdn_xhttp.remote.deploy_server") as deploy,
                 contextlib.redirect_stdout(io.StringIO()),
             ):
@@ -367,7 +373,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch.object(cli, "recover", return_value=remote),
                 patch.object(cli, "dns_preflight"),
                 patch("cdn_xhttp.remote.deploy_server") as deploy,
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(0, cli.main(self.args(base)))
@@ -414,7 +420,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch.object(cli, "recover") as recover,
                 patch.object(cli, "dns_preflight"),
                 patch("cdn_xhttp.remote.deploy_server") as resumed,
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(0, cli.main(self.args(base)))
@@ -511,7 +517,7 @@ class InstallationFlowTests(unittest.TestCase):
                 json.dumps(config(), indent=2) + "\n"
             ).replace("\n", "\r\n").encode("utf-8")
             target.write_bytes(original)
-            changed = {**config(), "connect_address": "1.1.1.1"}
+            changed = {**config(), "name": "Changed name"}
             with contextlib.redirect_stdout(io.StringIO()):
                 cli.save_configuration(target, changed, backup=True)
             actual = target.read_bytes()
@@ -549,7 +555,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch.object(cli, "recover") as recover,
                 patch.object(cli, "dns_preflight"),
                 patch("cdn_xhttp.remote.deploy_server") as deploy,
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(0, cli.main(self.args(base)))
@@ -559,33 +565,49 @@ class InstallationFlowTests(unittest.TestCase):
             self.assertEqual(desired["uuids"], load(target)["uuids"])
             self.assertFalse(cli.pending_path(target).exists())
 
-    def test_remote_success_is_saved_even_when_subsequent_edge_check_fails(self):
-        from cdn_xhttp.edge import EdgeSelectionError
-
+    def test_remote_success_issues_links_even_when_the_local_check_fails(self):
         old = config()
-        with tempfile.TemporaryDirectory() as directory:
-            base = Path(directory)
-            target = base / "deployment.json"
-            target.write_text(json.dumps(old), encoding="utf-8")
+        for outcome in (failed_result(), RuntimeError("unexpected check bug")):
             with (
-                patch("builtins.input", side_effect=["2", "3", "y"]),
-                patch("getpass.getpass", return_value=""),
-                patch.object(cli, "recover", return_value=old),
-                patch.object(cli, "dns_preflight"),
-                patch("cdn_xhttp.remote.deploy_server") as deploy,
-                patch.object(
-                    cli, "check", side_effect=EdgeSelectionError("unreachable")
-                ),
-                contextlib.redirect_stdout(io.StringIO()) as output,
+                self.subTest(outcome=type(outcome).__name__),
+                tempfile.TemporaryDirectory() as directory,
             ):
-                self.assertEqual(2, cli.main(self.args(base)))
-            self.assertEqual(deploy.call_args.args[0], load(target))
-            self.assertEqual(3, len(load(target)["uuids"]))
-            self.assertFalse(cli.pending_path(target).exists())
-            self.assertFalse((base / "result" / "vless.txt").exists())
-            self.assertNotIn("vless://", output.getvalue())
+                base = Path(directory)
+                target = base / "deployment.json"
+                target.write_text(json.dumps(old), encoding="utf-8")
+                behaviour = (
+                    {"side_effect": outcome}
+                    if isinstance(outcome, Exception)
+                    else {"return_value": outcome}
+                )
+                with (
+                    patch("builtins.input", side_effect=["2", "3", "y"]),
+                    patch("getpass.getpass", return_value=""),
+                    patch.object(cli, "recover", return_value=old),
+                    patch.object(cli, "dns_preflight"),
+                    patch("cdn_xhttp.remote.deploy_server") as deploy,
+                    patch.object(cli, "check", **behaviour),
+                    contextlib.redirect_stdout(io.StringIO()) as output,
+                ):
+                    self.assertEqual(0, cli.main(self.args(base)))
+                applied = load(target)
+                self.assertEqual(deploy.call_args.args[0], applied)
+                self.assertEqual(3, len(applied["uuids"]))
+                self.assertFalse(cli.pending_path(target).exists())
+                links = (base / "result" / "vless.txt").read_text(encoding="utf-8")
+                self.assertEqual(
+                    applied["uuids"],
+                    [urlsplit(link).username for link in links.splitlines()],
+                )
+                self.assertIn("vless://", output.getvalue())
+                self.assertIn("Предупреждение", output.getvalue())
+                status = json.loads(
+                    (base / "result" / "status.json").read_text(encoding="utf-8")
+                )
+                self.assertFalse(status["vless_tunnel_verified"])
+                self.assertNotIn("unexpected check bug", json.dumps(status))
 
-    def test_editing_domains_clears_cached_edge_and_retains_all_client_identities(self):
+    def test_editing_domains_retains_all_client_identities(self):
         value = {**config(), "connect_address": "1.1.1.1"}
         answers = [
             "new-origin.example.com",
@@ -646,7 +668,7 @@ class InstallationFlowTests(unittest.TestCase):
                 patch("builtins.input", side_effect=["5", "192.0.2.99", "", "", "1"]),
                 patch("getpass.getpass", return_value=""),
                 patch.object(cli, "recover", return_value=recovered),
-                patch.object(cli, "check", return_value=edge_result()),
+                patch.object(cli, "check", return_value=verified_result()),
                 contextlib.redirect_stdout(io.StringIO()),
             ):
                 self.assertEqual(0, cli.main(self.args(base)))
@@ -660,7 +682,6 @@ class ExportTests(unittest.TestCase):
     def test_revoked_server_uuids_are_never_reexported_from_a_stale_local_config(self):
         old = config()
         old["uuids"].append("1de7a7e8-c046-4fdc-b0ef-c03f83133882")
-        old["connect_address"] = "1.1.1.1"
         current = config()
         current["uuids"] = current["uuids"][:1]
         for command in ("wizard", "link", "check", "repair-edge"):
@@ -671,12 +692,16 @@ class ExportTests(unittest.TestCase):
                 base = Path(directory)
                 target = base / "deployment.json"
                 output = base / "result"
-                target.write_text(json.dumps(old), encoding="utf-8")
+                # A 0.3.x file still carries the selected edge address.
+                target.write_text(
+                    json.dumps({**old, "connect_address": "198.51.100.7"}),
+                    encoding="utf-8",
+                )
                 cli.write_connection(old, output, False)
                 with (
                     patch("builtins.input", return_value="1"),
                     patch.object(cli, "recover", return_value=current),
-                    patch.object(cli, "check", return_value=edge_result()) as check,
+                    patch.object(cli, "check", return_value=verified_result()) as check,
                     patch("cdn_xhttp.remote.deploy_server") as deploy,
                     contextlib.redirect_stdout(io.StringIO()),
                 ):
@@ -688,14 +713,18 @@ class ExportTests(unittest.TestCase):
                     )
                 deploy.assert_not_called()
                 self.assertEqual(current["uuids"], check.call_args.args[0]["uuids"])
-                self.assertEqual(
-                    old["connect_address"], check.call_args.args[0]["connect_address"]
-                )
+                self.assertNotIn("connect_address", check.call_args.args[0])
                 links = (output / "vless.txt").read_text(encoding="utf-8").splitlines()
                 self.assertEqual(
                     [current["uuid"]], [urlsplit(link).username for link in links]
                 )
+                self.assertEqual(
+                    ["cdn.example.com"], [urlsplit(link).hostname for link in links]
+                )
                 self.assertEqual(current["uuids"], load(target)["uuids"])
+                self.assertNotIn(
+                    "connect_address", target.read_text(encoding="utf-8")
+                )
                 self.assertFalse(any((output / "clients").glob("client-*.json")))
 
     def test_missing_managed_server_state_prevents_link_export(self):
@@ -877,7 +906,7 @@ class ExportTests(unittest.TestCase):
                 patch("getpass.getpass") as password,
                 patch.object(cli, "recover", return_value=value) as recover,
                 patch("cdn_xhttp.remote.deploy_server") as deploy,
-                patch.object(cli, "check", return_value=edge_result()) as check,
+                patch.object(cli, "check", return_value=verified_result()) as check,
                 contextlib.redirect_stdout(output),
             ):
                 status = cli.main(
@@ -905,19 +934,19 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(exported, printed)
             self.assertEqual(2, len(printed))
 
-    def test_check_delegates_to_full_tunnel_selection(self):
+    def test_check_delegates_to_informational_verification(self):
         with (
-            patch("cdn_xhttp.edge.select_edge", return_value=edge_result()) as select,
+            patch(
+                "cdn_xhttp.verify.verify_connection", return_value=verified_result()
+            ) as verify,
             contextlib.redirect_stdout(io.StringIO()),
         ):
             checks = cli.check(config())
-        self.assertEqual(edge_result(), checks)
-        self.assertEqual(config(), select.call_args.args[0])
+        self.assertEqual(verified_result(), checks)
+        self.assertEqual(config(), verify.call_args.args[0])
 
-    def test_failed_tunnel_never_issues_new_links_or_replaces_previous_config(self):
-        from cdn_xhttp.edge import EdgeSelectionError
-
-        for command in ("link", "check", "repair-edge"):
+    def test_failed_local_check_still_issues_links_for_the_cdn_domain(self):
+        for command, expected in (("link", 0), ("check", 2), ("repair-edge", 0)):
             with (
                 self.subTest(command=command),
                 tempfile.TemporaryDirectory() as directory,
@@ -925,68 +954,76 @@ class ExportTests(unittest.TestCase):
                 base = Path(directory)
                 target = base / "deployment.json"
                 target.write_text(json.dumps(config()), encoding="utf-8")
-                original = target.read_bytes()
                 result = base / "result"
                 result.mkdir()
                 (result / "vless.txt").write_text(
-                    "previous verified links", encoding="utf-8"
+                    "previous links", encoding="utf-8"
                 )
                 output = io.StringIO()
                 with (
                     patch.object(cli, "recover", return_value=config()),
-                    patch.object(
-                        cli, "check", side_effect=EdgeSelectionError("No working edge")
-                    ),
+                    patch.object(cli, "check", return_value=failed_result()),
                     patch("cdn_xhttp.remote.deploy_server") as deploy,
                     contextlib.redirect_stdout(output),
                 ):
                     status = cli.main(
                         [command, "--config", str(target), "--output", str(result)]
                     )
-                self.assertEqual(2, status)
+                self.assertEqual(expected, status)
                 deploy.assert_not_called()
-                self.assertEqual(original, target.read_bytes())
-                self.assertEqual(
-                    "previous verified links",
-                    (result / "vless.txt").read_text(encoding="utf-8"),
+                links = (result / "vless.txt").read_text(encoding="utf-8").splitlines()
+                self.assertEqual(config()["uuids"], [urlsplit(x).username for x in links])
+                self.assertTrue(all(urlsplit(x).hostname == "cdn.example.com" for x in links))
+                self.assertIn("vless://", output.getvalue())
+                self.assertTrue((result / "client.json").exists())
+                status_file = json.loads(
+                    (result / "status.json").read_text(encoding="utf-8")
                 )
-                self.assertNotIn("vless://", output.getvalue())
-                self.assertFalse((result / "client.json").exists())
-                self.assertFalse(
-                    json.loads((result / "status.json").read_text(encoding="utf-8"))[
-                        "vless_tunnel_verified"
-                    ]
-                )
+                self.assertFalse(status_file["vless_tunnel_verified"])
+                self.assertNotIn("connect_address", status_file)
+                self.assertNotIn("route", status_file)
+                self.assertEqual(failed_result()["checks"], status_file["checks"])
+                if command == "repair-edge":
+                    self.assertIn("устарела", output.getvalue())
 
-    def test_endpoint_success_without_tunnel_proof_does_not_publish(self):
+    def test_links_are_written_before_the_local_check_runs(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             target = base / "deployment.json"
             target.write_text(json.dumps(config()), encoding="utf-8")
+            result = base / "result"
+
+            def interrupted(value):
+                self.assertTrue((result / "vless.txt").exists())
+                raise KeyboardInterrupt()
+
             with (
                 patch.object(cli, "recover", return_value=config()),
-                patch.object(
-                    cli,
-                    "check",
-                    return_value={**edge_result(), "vless_tunnel_verified": False},
-                ),
+                patch.object(cli, "check", side_effect=interrupted),
                 contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()),
             ):
-                self.assertEqual(
-                    2,
-                    cli.main(
-                        [
-                            "link",
-                            "--config",
-                            str(target),
-                            "--output",
-                            str(base / "result"),
-                        ]
-                    ),
+                status = cli.main(
+                    ["link", "--config", str(target), "--output", str(result)]
                 )
-            self.assertFalse((base / "result" / "vless.txt").exists())
+            self.assertEqual(130, status)
+            self.assertEqual(
+                2, len((result / "vless.txt").read_text(encoding="utf-8").splitlines())
+            )
+            pending = json.loads((result / "status.json").read_text(encoding="utf-8"))
+            self.assertFalse(pending["vless_tunnel_verified"])
+            self.assertIn("not finished", pending["note"])
 
-    def test_offline_plan_does_not_call_edge_selector_or_ssh(self):
+    def test_repair_edge_is_hidden_from_help(self):
+        with (
+            contextlib.redirect_stdout(io.StringIO()) as output,
+            self.assertRaises(SystemExit),
+        ):
+            cli.main(["--help"])
+        self.assertNotIn("repair-edge", output.getvalue())
+        self.assertIn("link", output.getvalue())
+
+    def test_offline_plan_does_not_call_the_check_or_ssh(self):
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory)
             target = base / "deployment.json"

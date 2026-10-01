@@ -127,29 +127,24 @@ class ValidationTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 domain(value)
 
-    def test_edge_override_accepts_only_public_ip_and_leaves_domain_contract_intact(
-        self,
-    ):
-        for address in ("1.1.1.1", "2a02:6b8::1"):
-            value = validate(spec(connect_address=address))
-            self.assertEqual(address, value["connect_address"])
-            self.assertEqual("cdn.example.com", value["cdn_domain"])
+    def test_obsolete_edge_address_is_accepted_and_dropped(self):
+        # deployment.json, pending/backup files and setup.json of 0.2.0-0.3.1
+        # may carry any of these; loading must never fail because of them.
+        baseline = validate(spec())
         for address in (
-            None,
-            "",
-            "cdn.example.com",
-            "https://1.1.1.1",
+            "1.1.1.1",
+            "2a02:6b8::1",
+            "198.51.100.7",
             "127.0.0.1",
-            "10.0.0.1",
-            "192.0.2.1",
-            "224.0.0.1",
-            "::1",
-            "fe80::1",
-            "ff02::1",
-            "2a02:6b8::1%eth0",
+            "cdn.example.com",
+            "",
+            None,
+            17,
         ):
-            with self.subTest(address=address), self.assertRaises(ValueError):
-                validate(spec(connect_address=address))
+            with self.subTest(address=address):
+                value = validate(spec(connect_address=address))
+                self.assertNotIn("connect_address", value)
+                self.assertEqual(baseline, value)
 
     def test_atomic_private_write_does_not_truncate_old_file_if_replace_fails(self):
         from unittest.mock import patch
@@ -231,22 +226,27 @@ class ValidationTests(unittest.TestCase):
 
 
 class RenderTests(unittest.TestCase):
-    def test_edge_changes_only_connect_target_and_brackets_ipv6_in_uri(self):
-        baseline = validate(spec())
-        for address in ("1.1.1.1", "2a02:6b8::1"):
-            value = validate(spec(connect_address=address))
-            outbound = client_xray(value)["outbounds"][0]
-            self.assertEqual(address, outbound["settings"]["vnext"][0]["address"])
-            self.assertEqual(
-                client_xray(baseline)["outbounds"][0]["streamSettings"],
-                outbound["streamSettings"],
-            )
-            uri = urlsplit(vless_uri(value))
-            self.assertEqual((address, 443), (uri.hostname, uri.port))
-            params = parse_qs(uri.query)
-            self.assertEqual(["cdn.example.com"], params["sni"])
-            self.assertEqual(["cdn.example.com"], params["host"])
-            self.assertEqual(origin_xray(baseline), origin_xray(value))
+    def test_client_always_connects_to_the_cdn_domain(self):
+        value = validate(spec(connect_address="1.1.1.1"))
+        outbound = client_xray(value)["outbounds"][0]
+        self.assertEqual(
+            ("cdn.example.com", 443),
+            (
+                outbound["settings"]["vnext"][0]["address"],
+                outbound["settings"]["vnext"][0]["port"],
+            ),
+        )
+        # A raw dict that bypassed validation cannot pin an edge either.
+        raw = {**validate(spec()), "connect_address": "1.1.1.1"}
+        self.assertEqual(
+            "cdn.example.com",
+            client_xray(raw)["outbounds"][0]["settings"]["vnext"][0]["address"],
+        )
+        uri = urlsplit(vless_uri(raw))
+        self.assertEqual(("cdn.example.com", 443), (uri.hostname, uri.port))
+        params = parse_qs(uri.query)
+        self.assertEqual(["cdn.example.com"], params["sni"])
+        self.assertEqual(["cdn.example.com"], params["host"])
 
     def test_multiuser_links_select_distinct_authorized_identities(self):
         identities = [

@@ -202,7 +202,9 @@ def client_xray(c: dict, index: int = 0) -> dict:
                 "settings": {
                     "vnext": [
                         {
-                            "address": c.get("connect_address", c["cdn_domain"]),
+                            # Always the CDN domain: the CDN's own DNS picks
+                            # the edge, so no IP is pinned in the profile.
+                            "address": c["cdn_domain"],
                             "port": 443,
                             "users": [{"id": identity, "encryption": "none"}],
                         }
@@ -246,9 +248,7 @@ def vless_uri(c: dict, index: int = 0) -> str:
         "mode": "packet-up",
         "extra": json.dumps(extra(c), separators=(",", ":")),
     }
-    address = c.get("connect_address", c["cdn_domain"])
-    if ":" in address:
-        address = f"[{address}]"
+    address = c["cdn_domain"]
     return f"vless://{identity}@{address}:443?{urlencode(params, quote_via=quote)}#{quote(label, safe='')}"
 
 

@@ -246,6 +246,36 @@ def dns_preflight(c: dict) -> None:
         print(f"DNS {host}: OK")
 
 
+NOTE_PREVIEW = "Offline preview; authenticated VLESS tunnel is not verified."
+NOTE_PENDING = "Links issued; the local connection check has not finished."
+NOTE_VERIFIED = "Authenticated VLESS/XHTTP transfer through the CDN domain verified from this computer; availability can change."
+NOTE_UNVERIFIED = "Links issued; the local connection check did not confirm the tunnel from this computer (informational only)."
+
+
+def write_status(
+    directory: Path,
+    *,
+    endpoint_verified: bool,
+    vless_verified: bool,
+    note: str,
+    checks: dict | list | None = None,
+) -> None:
+    write_private(
+        directory / "status.json",
+        json.dumps(
+            {
+                "endpoint_verified": endpoint_verified,
+                "vless_tunnel_verified": vless_verified,
+                "note": note,
+                "checks": checks,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+    )
+
+
 def write_connection(
     c: dict,
     directory: Path,
@@ -253,7 +283,7 @@ def write_connection(
     checks: dict | list | None = None,
     *,
     vless_verified: bool = False,
-    route: str | None = None,
+    note: str | None = None,
 ) -> None:
     if directory.is_symlink():
         raise ValueError("Папка результата не должна быть символической ссылкой")
@@ -294,85 +324,74 @@ def write_connection(
                 clients_dir / f"client-{index + 1:03d}.json",
                 json.dumps(client_xray(c, index=index), indent=2) + "\n",
             )
-    write_private(
-        directory / "status.json",
-        json.dumps(
-            {
-                "endpoint_verified": verified,
-                "vless_tunnel_verified": vless_verified,
-                "connect_address": c.get("connect_address"),
-                "route": route,
-                "note": (
-                    "Authenticated VLESS/XHTTP transfer verified from this computer; availability can change."
-                    if vless_verified
-                    else "Offline preview; authenticated VLESS tunnel is not verified."
-                ),
-                "checks": checks,
-            },
-            indent=2,
-            ensure_ascii=False,
-        )
-        + "\n",
+    if note is None:
+        note = NOTE_VERIFIED if vless_verified else NOTE_PREVIEW
+    write_status(
+        directory,
+        endpoint_verified=verified,
+        vless_verified=vless_verified,
+        note=note,
+        checks=checks,
     )
 
 
 def check(c: dict) -> dict:
-    from .edge import select_edge
+    """Informational local check; network failures are results, not errors."""
+    from .verify import verify_connection
 
-    return select_edge(c, log=lambda message: print(message, flush=True))
+    return verify_connection(c, log=lambda message: print(message, flush=True))
 
 
-def issue_connections(c: dict, args: argparse.Namespace) -> int:
-    from .edge import EdgeSelectionError
+def issue_connections(
+    c: dict, args: argparse.Namespace, *, strict: bool = False
+) -> int:
+    """Always issue links for the current settings, then check them locally.
 
+    The check only informs: it never withholds or replaces the links. With
+    strict (the ``check`` command) an unconfirmed tunnel returns exit code 2.
+    """
+    c = validate(c)
+    previous_local = load(args.config) if args.config.exists() else None
+    write_connection(c, args.output, False, note=NOTE_PENDING)
+    save_configuration(
+        args.config,
+        c,
+        backup=previous_local is not None and previous_local != c,
+    )
+    print(f"Адрес подключения в ссылках: {c['cdn_domain']}:443 (CDN-домен).")
+    for index in range(len(c["uuids"])):
+        print(vless_uri(c, index=index))
+    print(f"Ссылки и клиентские конфиги: {args.output.resolve()}")
     print(
-        "Подбираем CDN Edge: сначала Ethernet, затем обычный маршрут. Проверяем полный VLESS/XHTTP-путь."
+        "Проверяем подключение с этого компьютера. Проверка только информирует: ссылки уже выданы."
     )
     try:
         result = check(c)
-        if (
-            result.get("endpoint_verified") is not True
-            or result.get("vless_tunnel_verified") is not True
-        ):
-            raise EdgeSelectionError("Полный VPN-путь не подтверждён")
-        selected = validate({**c, "connect_address": result["connect_address"]})
-    except EdgeSelectionError as exc:
-        write_private(
-            args.output / "status.json",
-            json.dumps(
-                {
-                    "endpoint_verified": False,
-                    "vless_tunnel_verified": False,
-                    "note": "Current verification failed; earlier connection files, if any, were not replaced.",
-                },
-                indent=2,
-            )
-            + "\n",
-        )
-        print(
-            f"CDN не подтверждён: {exc}. Новые ссылки не выданы; прежние файлы сохранены."
-        )
-        return 2
-    write_connection(
-        selected,
+    except Exception as exc:
+        # Never let an unexpected check failure turn issued links into an error.
+        result = {
+            "endpoint_verified": False,
+            "vless_tunnel_verified": False,
+            "checks": [
+                {"name": "verification", "ok": False, "error": type(exc).__name__}
+            ],
+        }
+    verified = result.get("vless_tunnel_verified") is True
+    write_status(
         args.output,
-        True,
-        result.get("checks"),
-        vless_verified=True,
-        route=result.get("route"),
+        endpoint_verified=result.get("endpoint_verified") is True,
+        vless_verified=verified,
+        note=NOTE_VERIFIED if verified else NOTE_UNVERIFIED,
+        checks=result.get("checks"),
     )
-    previous_local = load(args.config) if args.config.exists() else None
-    replaced_setup = previous_local is not None and {
-        key: value for key, value in previous_local.items() if key != "connect_address"
-    } != {key: value for key, value in selected.items() if key != "connect_address"}
-    save_configuration(args.config, selected, backup=replaced_setup)
-    print(
-        f"Полный VPN-путь проверен. Edge: {selected['connect_address']}; маршрут: {result.get('route', 'unknown')}."
-    )
-    for index in range(len(selected["uuids"])):
-        print(vless_uri(selected, index=index))
-    print(f"Ссылки, клиентские конфиги и результат проверки: {args.output.resolve()}")
-    return 0
+    if verified:
+        print("Полный VLESS-путь через CDN-домен подтверждён с этого компьютера.")
+    else:
+        print(
+            "Предупреждение: проверка с этого компьютера не подтвердила туннель. Ссылки выданы; "
+            f"причина — в {args.output / 'status.json'}. Проверьте подключение в клиентском приложении."
+        )
+    return 2 if strict and not verified else 0
 
 
 def show_summary(c: dict) -> None:
@@ -491,9 +510,7 @@ def deploy(
     save_configuration(args.config, c, backup=previous is not None)
     if previous is not None:
         pending_path(args.config).unlink()
-    print(
-        "\nСерверные настройки применены. Проверяем подключение перед выдачей ссылок."
-    )
+    print("\nСерверные настройки применены. Выдаём ссылки.")
     return issue_connections(c, args)
 
 
@@ -519,7 +536,7 @@ def plan(c: dict, directory: Path) -> None:
 
 def existing_action(path: Path) -> str:
     print(f"Управление настройками: {path}")
-    print("1 — Проверить / переподобрать Edge и выдать ссылки с прежними UUID")
+    print("1 — Выдать ссылки с прежними UUID и проверить подключение")
     print("2 — Изменить количество доступов (UUID)")
     print("3 — Изменить домены, название и параметры подключения")
     print("4 — Повторить установку с сохранёнными настройками")
@@ -604,10 +621,7 @@ def refresh_config(c: dict, args: argparse.Namespace, credentials: dict) -> dict
             raise ValueError(
                 "Установка программы на origin не найдена; список действующих UUID не подтверждён"
             )
-        current = complete_recovered(raw, c)
-        if c.get("connect_address") and c["cdn_domain"] == current["cdn_domain"]:
-            current["connect_address"] = c["connect_address"]
-        return current
+        return complete_recovered(raw, c)
     except BaseException:
         # A cancelled SSH read also invalidates this attempt, not the old link files.
         # Never serialize exception text: remote failures may contain credentials.
@@ -616,17 +630,11 @@ def refresh_config(c: dict, args: argparse.Namespace, credentials: dict) -> dict
                 raise ValueError(
                     "Папка результата не должна быть символической ссылкой"
                 )
-            write_private(
-                args.output / "status.json",
-                json.dumps(
-                    {
-                        "endpoint_verified": False,
-                        "vless_tunnel_verified": False,
-                        "note": "Current server configuration could not be verified; earlier connection files, if any, were not replaced.",
-                    },
-                    indent=2,
-                )
-                + "\n",
+            write_status(
+                args.output,
+                endpoint_verified=False,
+                vless_verified=False,
+                note="Current server configuration could not be read over SSH; no links were issued and earlier connection files, if any, were not replaced.",
             )
         except (OSError, ValueError):
             # Preserve the original failure when the output is not writable.
@@ -689,7 +697,6 @@ def change_settings(c: dict) -> dict:
 
         updated[key] = ask_validated(label, checked_field, updated[key])
     if any(updated[key] != c[key] for key in ("origin_domain", "cdn_domain")):
-        updated.pop("connect_address", None)
         print(
             "Обновите DNS, сертификат CDN и Origin/Host/SNI ресурса CDN под новые домены. Без этого проверка туннеля может не пройти."
         )
@@ -760,10 +767,13 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="VLESS XHTTP TLS: настройка VPS под существующий CDN"
     )
+    commands = ["wizard", "manage", "deploy", "plan", "check", "link", "update"]
     parser.add_argument(
         "command",
         nargs="?",
-        choices=["wizard", "manage", "deploy", "plan", "check", "link", "repair-edge", "update"],
+        # repair-edge is a hidden alias of link kept for scripts of 0.2-0.3.
+        choices=commands + ["repair-edge"],
+        metavar="{" + ",".join(commands) + "}",
         default="wizard",
     )
     parser.add_argument("--version", action="version", version=__version__)
@@ -816,7 +826,15 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "plan":
             plan(c, args.output)
         elif args.command in {"check", "link", "repair-edge"}:
-            return issue_connections(refresh_config(c, args, credentials), args)
+            if args.command == "repair-edge":
+                print(
+                    "Команда repair-edge устарела: подбор адреса CDN больше не нужен, ссылки используют CDN-домен. Выполняем link."
+                )
+            return issue_connections(
+                refresh_config(c, args, credentials),
+                args,
+                strict=args.command == "check",
+            )
         return 0
     except (KeyboardInterrupt, EOFError):
         print(

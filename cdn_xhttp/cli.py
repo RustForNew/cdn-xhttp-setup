@@ -220,6 +220,11 @@ def save_configuration(path: Path, c: dict, *, backup: bool = False) -> None:
             os.unlink(temporary)
 
 
+# VPN clients in fake-ip or TUN mode answer every name from this benchmark
+# range (RFC 2544) and resolve the real address themselves later.
+FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
 def dns_preflight(c: dict) -> None:
     for role in ("origin", "exit"):
         if not c.get(role):
@@ -235,6 +240,18 @@ def dns_preflight(c: dict) -> None:
             raise ValueError(
                 f"DNS {host} не разрешается. Создайте A/AAAA-запись до установки"
             ) from exc
+        fake = sorted(
+            str(address)
+            for address in addresses
+            if address.version == 4 and address in FAKE_IP_NETWORK
+        )
+        if fake and expected not in FAKE_IP_NETWORK:
+            # The VPS checks the real A/AAAA records again before ACME.
+            print(
+                f"DNS {host}: локальный резолвер вернул {', '.join(fake)} из 198.18.0.0/15 — так отвечает VPN в режиме fake-ip/TUN. "
+                "Проверить запись с этого компьютера нельзя; VPS сверит A/AAAA со своим IP перед выпуском сертификата."
+            )
+            continue
         if expected not in addresses:
             raise ValueError(f"DNS {host} не указывает на заданный IP {expected}")
         # A separately routable IPv6 may belong to the same VPS; never silently ignore it.
@@ -454,6 +471,38 @@ def stage_pending(path: Path, c: dict, previous: dict) -> None:
         )
 
 
+def check_topology(c: dict, previous: dict | None, config_path: Path) -> None:
+    """Render every role offline; refuse a change that cannot be applied."""
+    from .remote import render_bootstrap
+
+    try:
+        for role in ("exit", "origin"):
+            if c.get(role):
+                if previous is None:
+                    render_bootstrap(c, role)
+                else:
+                    render_bootstrap(c, role, previous=previous)
+    except ValueError as exc:
+        reason = f"Изменение нельзя применить: {exc}"
+        # Releases up to 0.3.1 staged such a change before this check; offer
+        # to discard that stuck pending file, the main settings stay intact.
+        try:
+            stuck = previous is not None and read_pending(config_path) == (
+                validate(c),
+                validate(previous),
+            )
+        except ValueError:
+            stuck = False
+        if stuck:
+            print(f"{reason}.")
+            if yes(
+                f"Удалить невыполнимое незавершённое изменение {pending_path(config_path)}? Основной файл настроек не изменится"
+            ):
+                pending_path(config_path).unlink()
+                print("Незавершённое изменение удалено.")
+        raise ValueError(reason) from None
+
+
 def deploy(
     c: dict,
     args: argparse.Namespace,
@@ -464,6 +513,9 @@ def deploy(
     from .remote import deploy_server
 
     credentials = credentials if credentials is not None else {}
+    # Validate the topology before anything is staged: a pending file for a
+    # change that can never be rendered would otherwise block the menu.
+    check_topology(c, previous, args.config)
     show_summary(c)
     print(
         "Будут установлены Xray, Certbot и службы проекта; на origin — Nginx. Нужен выделенный VPS без посторонних сайтов на 80/443."
@@ -546,11 +598,10 @@ def existing_action(path: Path) -> str:
     print("0 — Выход")
     while True:
         choice = ask("Выберите действие", "1")
-        if choice in {"0", "1", "2", "3", "4", "5"} or (
-            choice == "6" and pending_path(path).exists()
-        ):
+        resumable = pending_path(path).exists()
+        if choice in {"0", "1", "2", "3", "4", "5"} or (choice == "6" and resumable):
             return choice
-        print("Введите число от 0 до 5.")
+        print(f"Введите число от 0 до {6 if resumable else 5}.")
 
 
 def recover(

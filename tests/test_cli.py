@@ -678,6 +678,110 @@ class InstallationFlowTests(unittest.TestCase):
             )
 
 
+class PreflightTests(unittest.TestCase):
+    def args(self, base, command="wizard"):
+        return [
+            command,
+            "--config",
+            str(base / "deployment.json"),
+            "--output",
+            str(base / "result"),
+        ]
+
+    def bridged(self):
+        return validate(
+            {
+                **config(),
+                "exit": {"host": "192.0.2.20", "user": "root", "port": 22},
+                "exit_domain": "exit.example.com",
+            }
+        )
+
+    def test_topology_change_is_refused_before_pending_is_staged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "deployment.json"
+            # The local copy adds an exit that the installed origin lacks.
+            target.write_text(json.dumps(self.bridged()), encoding="utf-8")
+            original = target.read_bytes()
+            with (
+                patch("builtins.input") as prompt,
+                patch("getpass.getpass") as password,
+                patch.object(cli, "recover", return_value=config()),
+                patch.object(cli, "dns_preflight") as dns,
+                patch("cdn_xhttp.remote.deploy_server") as deploy,
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as errors,
+            ):
+                self.assertEqual(1, cli.main(self.args(base, "deploy")))
+            self.assertIn("Изменение нельзя применить", errors.getvalue())
+            prompt.assert_not_called()
+            password.assert_not_called()
+            dns.assert_not_called()
+            deploy.assert_not_called()
+            self.assertFalse(cli.pending_path(target).exists())
+            self.assertEqual(original, target.read_bytes())
+
+    def test_stuck_pending_of_an_earlier_release_can_be_discarded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            target = base / "deployment.json"
+            target.write_text(json.dumps(config()), encoding="utf-8")
+            original = target.read_bytes()
+            # 0.3.1 staged an impossible topology change before validating it.
+            cli.stage_pending(target, self.bridged(), config())
+            with (
+                patch("builtins.input", side_effect=["6", "y"]),
+                patch("getpass.getpass") as password,
+                patch("cdn_xhttp.remote.deploy_server") as deploy,
+                contextlib.redirect_stdout(io.StringIO()) as output,
+                contextlib.redirect_stderr(io.StringIO()),
+            ):
+                self.assertEqual(1, cli.main(self.args(base)))
+            self.assertIn("удалено", output.getvalue())
+            password.assert_not_called()
+            deploy.assert_not_called()
+            self.assertFalse(cli.pending_path(target).exists())
+            self.assertEqual(original, target.read_bytes())
+
+    def test_fake_ip_answer_of_a_local_vpn_is_not_an_installation_error(self):
+        def answer(*addresses):
+            return [(2, 1, 6, "", (address, 80)) for address in addresses]
+
+        value = self.bridged()
+        with (
+            patch.object(cli.socket, "getaddrinfo", return_value=answer("198.18.0.7")),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            cli.dns_preflight(value)
+        self.assertIn("fake-ip", output.getvalue())
+        for addresses in (("192.0.2.99",), ("192.0.2.10", "192.0.2.99")):
+            with (
+                self.subTest(addresses=addresses),
+                patch.object(cli.socket, "getaddrinfo", return_value=answer(*addresses)),
+                contextlib.redirect_stdout(io.StringIO()),
+                self.assertRaises(ValueError),
+            ):
+                cli.dns_preflight(config())
+
+    def test_menu_error_names_the_visible_range(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "deployment.json"
+            with (
+                patch("builtins.input", side_effect=["9", "0"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual("0", cli.existing_action(target))
+            self.assertIn("от 0 до 5", output.getvalue())
+            cli.stage_pending(target, {**config(), "name": "Updated"}, config())
+            with (
+                patch("builtins.input", side_effect=["9", "6"]),
+                contextlib.redirect_stdout(io.StringIO()) as output,
+            ):
+                self.assertEqual("6", cli.existing_action(target))
+            self.assertIn("от 0 до 6", output.getvalue())
+
+
 class ExportTests(unittest.TestCase):
     def test_revoked_server_uuids_are_never_reexported_from_a_stale_local_config(self):
         old = config()

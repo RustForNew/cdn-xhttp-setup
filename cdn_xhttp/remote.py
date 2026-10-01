@@ -96,8 +96,22 @@ def _identity(config: dict, role: str) -> str:
     )
 
 
+def _accepted_runtimes(config: dict, role: str) -> list[dict]:
+    """Runtime configs that represent ``config``, including earlier releases.
+
+    Releases up to 0.3.1 rendered the origin inbound differently; an existing
+    installation must still be recognized when this release updates it.
+    """
+    from .render import exit_xray, origin_xray, previous_origin_xray
+
+    if role == "exit":
+        return [exit_xray(config)]
+    return [origin_xray(config), previous_origin_xray(config)]
+
+
 def render_bootstrap(config: dict, role: str, *, previous: dict | None = None) -> str:
     """Render a root bash script; its contents include the private VLESS UUID."""
+    from .config import PREVIOUS_XRAY_VERSIONS, XRAY_VERSION
     from .render import exit_xray, nginx_config, origin_xray
 
     if role not in {"origin", "exit"}:
@@ -108,9 +122,13 @@ def render_bootstrap(config: dict, role: str, *, previous: dict | None = None) -
     domain = config["origin_domain"] if role == "origin" else config.get("exit_domain")
     if not domain:
         raise ValueError("exit_domain is required for an exit server")
-    version = config.get("xray_version", "26.5.9")
-    if not re.fullmatch(r"\d{1,4}\.\d{1,2}\.\d{1,2}", version):
+    version = config.get("xray_version") or XRAY_VERSION
+    if not isinstance(version, str) or not re.fullmatch(
+        r"\d{1,4}\.\d{1,2}\.\d{1,2}", version
+    ):
         raise ValueError("Invalid Xray version")
+    if version in PREVIOUS_XRAY_VERSIONS:
+        version = XRAY_VERSION
     # All substitutions are quoted shell words or base64, including values which
     # normal CLI validation has already constrained.
     settings = {
@@ -140,14 +158,15 @@ def render_bootstrap(config: dict, role: str, *, previous: dict | None = None) -
         + shlex.quote(_encoded(_identity(previous, role)) if previous else "")
         + "\n"
     )
-    previous_xray = (
-        (origin_xray(previous) if role == "origin" else exit_xray(previous))
+    # Retries may find the target already applied by this or an earlier release.
+    accepted_xray = (
+        _accepted_runtimes(previous, role) + _accepted_runtimes(config, role)[1:]
         if previous
         else None
     )
     header += (
         "PREVIOUS_XRAY="
-        + shlex.quote(_encoded(json.dumps(previous_xray)) if previous else "")
+        + shlex.quote(_encoded(json.dumps(accepted_xray)) if previous else "")
         + "\n"
     )
     current_xray = origin_xray(config) if role == "origin" else exit_xray(config)
@@ -214,14 +233,20 @@ if [[ -n "$PREVIOUS_XRAY" ]]; then
     PREVIOUS_XRAY="$PREVIOUS_XRAY" CURRENT_XRAY="$CURRENT_XRAY" python3 - <<'PY_PREVIOUS'
 import base64, json, os, pathlib
 p = pathlib.Path('/etc/cdn-xhttp/config.json')
-if p.is_symlink() or json.loads(p.read_text()) not in [json.loads(base64.b64decode(os.environ[key])) for key in ('PREVIOUS_XRAY', 'CURRENT_XRAY')]:
+# PREVIOUS_XRAY lists every accepted rendering, including earlier releases.
+accepted = json.loads(base64.b64decode(os.environ['PREVIOUS_XRAY']))
+accepted.append(json.loads(base64.b64decode(os.environ['CURRENT_XRAY'])))
+if p.is_symlink() or json.loads(p.read_text()) not in accepted:
     raise SystemExit('ERROR: Xray configuration changed since it was read; reconnect before updating.')
 PY_PREVIOUS
     PREVIOUS_SETUP="$PREVIOUS_SETUP" TARGET_SETUP="$TARGET_SETUP" python3 - <<'PY_SETUP'
 import base64, json, os, pathlib
 def canonical(value):
     value = dict(value)
+    # Local-only or migrated fields: an obsolete edge address and the Xray
+    # version pinned by an earlier release are not concurrent changes.
     value.pop('connect_address', None)
+    value.pop('xray_version', None)
     for role in ('origin', 'exit'):
         if value.get(role):
             value[role] = {'host': value[role]['host']}
@@ -519,14 +544,17 @@ if [[ "$ROLE" == origin ]]; then
     systemctl is-active --quiet nginx.service || fail "nginx is inactive."
     ss -H -lnt 'sport = :8003' | grep -q '127.0.0.1:8003' || fail "Xray is not listening on loopback:8003."
     ss -H -lnt 'sport = :8004' | grep -q '127.0.0.1:8004' || fail "Health probe is not listening on loopback:8004."
-    RESULT=$(curl --silent --show-error --fail --max-time 15 --noproxy '*' --resolve "$DOMAIN:443:127.0.0.1" -X OPTIONS --data-binary 'test' -o "$STAGING/probe.json" -w '%{http_code}' "https://$DOMAIN/cdn-check")
+    RESULT=$(curl --silent --show-error --fail --max-time 15 --noproxy '*' --resolve "$DOMAIN:443:127.0.0.1" -X OPTIONS -H 'X-Data-0: probe' --data-binary 'test' -o "$STAGING/probe.json" -w '%{http_code}' "https://$DOMAIN/cdn-check")
     [[ "$RESULT" == 200 ]] || fail "Local origin OPTIONS probe did not return 200."
     python3 - "$STAGING/probe.json" <<'PY_PROBE'
 import hashlib, json, pathlib, sys
 body = json.loads(pathlib.Path(sys.argv[1]).read_text())
-expected = {'method': 'OPTIONS', 'length': 4, 'sha256': hashlib.sha256(b'test').hexdigest()}
+expected = {
+    'method': 'OPTIONS', 'length': 4, 'sha256': hashlib.sha256(b'test').hexdigest(),
+    'header_bytes': 5, 'header_sha256': hashlib.sha256(b'probe').hexdigest(),
+}
 if body != expected:
-    raise SystemExit('ERROR: Local origin OPTIONS body-integrity check failed.')
+    raise SystemExit('ERROR: Local origin OPTIONS body/header integrity check failed.')
 PY_PROBE
 else
     ss -H -lnt 'sport = :10443' | grep -q ':10443' || fail "Exit is not listening on 10443."
@@ -650,7 +678,6 @@ with open('/run/lock/cdn-xhttp.lock', 'a') as lock:
 def _recovered_config(payload: dict, server: dict) -> dict | None:
     """Decode owned v0.2 metadata, or reconstruct the supported v0.1 layout."""
     from .config import XRAY_VERSION, validate
-    from .render import origin_xray
 
     if not payload:
         return None
@@ -668,6 +695,8 @@ def _recovered_config(payload: dict, server: dict) -> dict | None:
         try:
             inbound = runtime["inbounds"][0]
             xhttp = inbound["streamSettings"]["xhttpSettings"]
+            # Releases from 0.4.0 keep padding inside xhttpSettings.extra.
+            xhttp = {**xhttp, **xhttp.get("extra", {})}
             uuids = [user["id"] for user in inbound["settings"]["users"]]
             c = {
                 "origin": dict(server),
@@ -698,10 +727,17 @@ def _recovered_config(payload: dict, server: dict) -> dict | None:
             raise RemoteError(
                 "Unsupported legacy configuration; existing settings were preserved"
             ) from None
-    if identity != json.loads(_identity(c, "origin")) or runtime != origin_xray(c):
+    current, *earlier = _accepted_runtimes(c, "origin")
+    if identity != json.loads(_identity(c, "origin")) or (
+        runtime != current and runtime not in earlier
+    ):
         raise RemoteError(
             "Server configuration differs from its saved setup; inspect it before changing settings"
         )
+    if runtime != current:
+        # Installed by an earlier release: links of this release need a
+        # reinstall of the server with the same settings and UUIDs.
+        c["_server_outdated"] = True
     if legacy:
         c["email"] = ""
         c["_recovered_legacy"] = True

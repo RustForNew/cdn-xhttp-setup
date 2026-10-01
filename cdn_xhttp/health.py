@@ -1,7 +1,8 @@
-"""Check that TLS, OPTIONS and its actual body survive the CDN path."""
+"""Check that TLS, OPTIONS and its X-Data-N headers survive the CDN path."""
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import http.client
 import json
@@ -11,11 +12,19 @@ import ssl
 import time
 from typing import Any
 
+# The XHTTP client splits each packet into X-Data-N headers of this size.
+HEADER_CHUNK = 4096
+MAX_HEADER_BYTES = 32 * 1024
+
 
 # This self-contained program is installed on the origin. Its port is loopback
 # only; nginx exposes just /cdn-check and buffers that diagnostic request body.
 HEALTH_SERVER_SOURCE = r'''#!/usr/bin/env python3
-"""Loopback-only diagnostic endpoint for CDN OPTIONS request bodies."""
+"""Loopback-only diagnostic endpoint for CDN OPTIONS requests.
+
+Reports the method plus length and SHA-256 of the request body and of the
+concatenated X-Data-0, X-Data-1, ... headers that carry XHTTP uplink.
+"""
 import hashlib
 import json
 import socket
@@ -56,7 +65,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         if self.headers.get_all("Transfer-Encoding"):
             self.respond(400, {"error": "chunked requests are not supported"})
             return
-        lengths = self.headers.get_all("Content-Length", [])
+        # A CDN may forward a bodyless OPTIONS without Content-Length.
+        lengths = self.headers.get_all("Content-Length", []) or ["0"]
         if len(lengths) != 1 or not lengths[0].isascii() or not lengths[0].isdigit():
             self.respond(411, {"error": "one valid Content-Length is required"})
             return
@@ -76,10 +86,20 @@ class HealthHandler(BaseHTTPRequestHandler):
         if len(body) != length:
             self.respond(400, {"error": "incomplete request body"})
             return
+        chunks = []
+        while True:
+            value = self.headers.get("X-Data-%d" % len(chunks))
+            if value is None:
+                break
+            chunks.append(value)
+        # http.server decodes header lines as Latin-1; restore their bytes.
+        data = "".join(chunks).encode("latin-1", "replace")
         self.respond(200, {
             "method": self.command,
             "length": len(body),
             "sha256": hashlib.sha256(body).hexdigest(),
+            "header_bytes": len(data),
+            "header_sha256": hashlib.sha256(data).hexdigest(),
         })
 
     def reject_method(self):
@@ -114,11 +134,27 @@ def _domain(value: str) -> str:
     return host
 
 
+def header_payload(size: int) -> tuple[dict[str, str], int, str]:
+    """Random base64url data split into X-Data-N headers like XHTTP uplink."""
+    text = base64.urlsafe_b64encode(secrets.token_bytes(size)).decode("ascii")
+    text = text.rstrip("=")
+    headers = {
+        f"X-Data-{index}": text[offset : offset + HEADER_CHUNK]
+        for index, offset in enumerate(range(0, len(text), HEADER_CHUNK))
+    }
+    return headers, len(text), hashlib.sha256(text.encode("ascii")).hexdigest()
+
+
 def _probe(domain: str, size: int, timeout: float) -> dict[str, Any]:
-    payload = secrets.token_bytes(size)
-    digest = hashlib.sha256(payload).hexdigest()
+    data_headers, header_bytes, digest = header_payload(size)
     path = "/cdn-check?nonce=" + secrets.token_hex(16)
-    result: dict[str, Any] = {"bytes": size, "ok": False, "status": None, "errors": []}
+    result: dict[str, Any] = {
+        "bytes": size,
+        "header_bytes": header_bytes,
+        "ok": False,
+        "status": None,
+        "errors": [],
+    }
     errors = result["errors"]
     started = time.monotonic()
     # HTTPSConnection does not follow redirects. Use the normal trust store and
@@ -127,15 +163,15 @@ def _probe(domain: str, size: int, timeout: float) -> dict[str, Any]:
         domain, 443, timeout=timeout, context=ssl.create_default_context()
     )
     try:
+        # Bodyless like the XHTTP uplink: Yandex CDN rejects any OPTIONS body
+        # with HTTP 413, so the data travels in request headers only.
         connection.request(
             "OPTIONS",
             path,
-            body=payload,
             headers={
-                "Content-Type": "application/octet-stream",
-                "Content-Length": str(size),
                 "Cache-Control": "no-store",
                 "Connection": "close",
+                **data_headers,
             },
         )
         response = connection.getresponse()
@@ -144,6 +180,10 @@ def _probe(domain: str, size: int, timeout: float) -> dict[str, Any]:
             if 300 <= response.status < 400:
                 errors.append(
                     "Redirect rejected; /cdn-check must reach the configured origin directly"
+                )
+            elif response.status == 413:
+                errors.append(
+                    "HTTP 413: the CDN or origin rejected the request size or an OPTIONS body"
                 )
             else:
                 errors.append(f"Expected HTTP 200, received {response.status}")
@@ -174,11 +214,15 @@ def _probe(domain: str, size: int, timeout: float) -> dict[str, Any]:
             return result
         if body.get("method") != "OPTIONS":
             errors.append("OPTIONS was changed before reaching the health service")
-        if type(body.get("length")) is not int or body["length"] != size:
-            errors.append("Origin did not receive the complete OPTIONS request body")
-        if body.get("sha256") != digest:
+        if body.get("length") != 0:
+            errors.append("The bodyless OPTIONS request reached the origin with a body")
+        if (
+            type(body.get("header_bytes")) is not int
+            or body["header_bytes"] != header_bytes
+            or body.get("header_sha256") != digest
+        ):
             errors.append(
-                "OPTIONS body SHA-256 mismatch: body was changed, dropped or cached"
+                "X-Data headers SHA-256 mismatch: headers were changed, dropped or cached"
             )
         result["ok"] = not errors
         return result
@@ -191,11 +235,13 @@ def _probe(domain: str, size: int, timeout: float) -> dict[str, Any]:
 
 
 def check_endpoint(
-    domain: str, *, timeout: float = 15, max_bytes: int = 65536
+    domain: str, *, timeout: float = 15, max_bytes: int = 16384
 ) -> dict[str, Any]:
-    """Test 4-byte and max_bytes OPTIONS bodies over verified HTTPS.
+    """Send bodyless OPTIONS /cdn-check with 16 bytes, then max_bytes in headers.
 
-    max_bytes controls the larger request size (4 bytes to 1 MiB). No remote
+    The data is base64url text in X-Data-N headers of 4096 characters, the
+    shape of one XHTTP uplink packet. max_bytes (4 to 24576) is the binary
+    size; the default 16384 matches the client packet. No remote
     configuration changes are made. Errors are returned as JSON-safe values.
     """
     result: dict[str, Any] = {
@@ -215,13 +261,16 @@ def check_endpoint(
             raise ValueError(
                 "timeout must be greater than zero and at most 300 seconds"
             )
-        if type(max_bytes) is not int or not 4 <= max_bytes <= 1024 * 1024:
-            raise ValueError("max_bytes must be an integer from 4 to 1048576")
+        if (
+            type(max_bytes) is not int
+            or not 4 <= max_bytes <= MAX_HEADER_BYTES * 3 // 4
+        ):
+            raise ValueError("max_bytes must be an integer from 4 to 24576")
     except ValueError as exc:
         result["errors"].append(str(exc))
         return result
     result["domain"] = host
-    for size in dict.fromkeys((4, max_bytes)):
+    for size in dict.fromkeys((min(16, max_bytes), max_bytes)):
         probe = _probe(host, size, timeout)
         result["probes"].append(probe)
         result["status"] = probe["status"]

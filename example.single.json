@@ -11,5 +11,5 @@
   "path": "/api-test",
   "padding_key": "dc",
   "profile": "fast",
-  "xray_version": "26.5.9"
+  "xray_version": "26.9.9"
 }

@@ -26,7 +26,7 @@ def config():
         "path": "/api-test",
         "padding_key": "dc",
         "profile": "fast",
-        "xray_version": "26.5.9",
+        "xray_version": "26.9.9",
     }
 
 
@@ -57,7 +57,7 @@ def test_bootstrap_rejects_missing_exit_and_invalid_version(config):
     config["exit"] = None
     with pytest.raises(ValueError, match="No exit"):
         remote.render_bootstrap(config, "exit")
-    config["xray_version"] = "26.5.9; touch /root/oops"
+    config["xray_version"] = "26.9.9; touch /root/oops"
     with pytest.raises(ValueError, match="Invalid Xray"):
         remote.render_bootstrap(config, "origin")
 
@@ -103,7 +103,14 @@ def test_os_release_does_not_overwrite_pinned_xray_version(config):
         timeout=20,
     )
     assert result.returncode == 0
-    assert result.stdout == "26.5.9"
+    assert result.stdout == "26.9.9"
+
+
+def test_saved_version_of_earlier_release_installs_the_pinned_xray(config):
+    config["xray_version"] = "26.5.9"
+    script = remote.render_bootstrap(config, "origin")
+    assert "XRAY_VERSION=26.9.9\n" in script
+    assert "26.5.9" not in script.split("fail()", 1)[0]
 
 
 class FakeChannel:
@@ -413,23 +420,47 @@ def test_recovery_roundtrip_and_foreign_runtime_rejected(config):
     assert remote._recovered_config({}, login) is None
 
 
+def test_recovery_of_an_earlier_release_migrates_and_flags_reinstall(config):
+    import json
+    from cdn_xhttp.config import XRAY_VERSION, validate
+    from cdn_xhttp.render import previous_origin_xray
+
+    c = validate(config)
+    # setup.json written by 0.3.x pinned Xray 26.5.9.
+    saved = {**c, "xray_version": "26.5.9"}
+    payload = {
+        "deployment.json": json.loads(remote._identity(c, "origin")),
+        "config.json": previous_origin_xray(c),
+        "setup.json": saved,
+    }
+    recovered = remote._recovered_config(payload, c["origin"])
+    assert recovered.pop("_server_outdated") is True
+    assert recovered == c
+    assert recovered["xray_version"] == XRAY_VERSION
+
+
+@pytest.mark.parametrize("layout", ["previous_release", "current"])
 @pytest.mark.parametrize("bridge", [True, False])
-def test_legacy_recovery_preserves_all_users_and_transport(config, bridge):
+def test_legacy_recovery_preserves_all_users_and_transport(config, bridge, layout):
     import json
     from cdn_xhttp.config import validate
-    from cdn_xhttp.render import origin_xray
+    from cdn_xhttp.render import origin_xray, previous_origin_xray
 
     if not bridge:
         config["exit"] = None
         config.pop("exit_domain")
     config["uuids"] = [config["uuid"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
+    config["padding_key"] = "pad42"
     c = validate(config)
+    render = previous_origin_xray if layout == "previous_release" else origin_xray
     payload = {
         "deployment.json": json.loads(remote._identity(c, "origin")),
-        "config.json": origin_xray(c),
+        "config.json": render(c),
     }
     recovered = remote._recovered_config(payload, c["origin"])
     assert recovered.pop("_recovered_legacy") is True
+    assert recovered.pop("_server_outdated", False) is (layout == "previous_release")
+    assert recovered["padding_key"] == "pad42"
     assert recovered["email"] == ""
     recovered["email"] = c["email"]
     assert origin_xray(validate(recovered)) == origin_xray(c)
@@ -504,22 +535,31 @@ def test_managed_domain_update_script_is_valid_and_saves_private_setup(config, r
     assert "install -m 600 -o root -g root" in script
 
 
-@pytest.mark.parametrize("runtime_kind", ["previous", "target", "changed"])
+@pytest.mark.parametrize(
+    "runtime_kind",
+    ["previous", "previous_release", "target", "target_release", "changed"],
+)
 def test_update_compare_and_swap_allows_retry_but_refuses_concurrent_change(
     config, tmp_path, runtime_kind
 ):
     import base64
     import copy
     import json
-    from cdn_xhttp.render import origin_xray
+    import re
+    from cdn_xhttp.render import origin_xray, previous_origin_xray
 
     updated = copy.deepcopy(config)
     updated["uuids"] = [config["uuid"], "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"]
-    previous = origin_xray(config)
-    target = origin_xray(updated)
-    actual = previous if runtime_kind == "previous" else target
+    actual = {
+        "previous": origin_xray(config),
+        # Installed by 0.3.1 or earlier, before the header uplink.
+        "previous_release": previous_origin_xray(config),
+        "target": origin_xray(updated),
+        # An earlier release already applied the same target.
+        "target_release": previous_origin_xray(updated),
+        "changed": copy.deepcopy(origin_xray(updated)),
+    }[runtime_kind]
     if runtime_kind == "changed":
-        actual = copy.deepcopy(target)
         actual["inbounds"][0]["port"] = 9000
     runtime = tmp_path / "runtime.json"
     runtime.write_text(json.dumps(actual), encoding="utf-8")
@@ -527,19 +567,21 @@ def test_update_compare_and_swap_allows_retry_but_refuses_concurrent_change(
         "\nPY_PREVIOUS", 1
     )[0]
     source = source.replace("'/etc/cdn-xhttp/config.json'", repr(runtime.as_posix()))
+    # Use exactly the values the generated update script would pass.
+    script = remote.render_bootstrap(updated, "origin", previous=config)
+    values = {
+        key: re.search(rf"^{key}=(\S+)$", script, re.M).group(1)
+        for key in ("PREVIOUS_XRAY", "CURRENT_XRAY")
+    }
     import sys
 
     result = subprocess.run(
         [sys.executable, "-c", source],
-        env={
-            **os.environ,
-            "PREVIOUS_XRAY": base64.b64encode(json.dumps(previous).encode()).decode(),
-            "CURRENT_XRAY": base64.b64encode(json.dumps(target).encode()).decode(),
-        },
+        env={**os.environ, **values},
         capture_output=True,
         text=True,
     )
-    assert (result.returncode == 0) == (runtime_kind != "changed")
+    assert (result.returncode == 0) == (runtime_kind != "changed"), result.stderr
 
 
 def test_legacy_certificate_ownership_survives_a_to_b_to_a(tmp_path):
@@ -587,7 +629,8 @@ def test_legacy_certificate_ownership_survives_a_to_b_to_a(tmp_path):
 
 
 @pytest.mark.parametrize(
-    "changed_field", ["name", "profile", "email", "connect_address", "ssh_login"]
+    "changed_field",
+    ["name", "profile", "email", "connect_address", "ssh_login", "xray_version"],
 )
 def test_metadata_compare_and_swap_rejects_concurrent_settings_but_accepts_local_only(
     config, tmp_path, changed_field
@@ -606,6 +649,8 @@ def test_metadata_compare_and_swap_rejects_concurrent_settings_but_accepts_local
         "profile": "original",
         "email": "other@example.com",
         "connect_address": "8.8.8.8",
+        # setup.json saved by 0.3.x carries the previously pinned version.
+        "xray_version": "26.5.9",
     }
     if changed_field == "ssh_login":
         actual["origin"]["user"] = "ubuntu"
@@ -625,5 +670,5 @@ def test_metadata_compare_and_swap_rejects_concurrent_settings_but_accepts_local
         },
     )
     assert (result.returncode == 0) == (
-        changed_field in {"connect_address", "ssh_login"}
+        changed_field in {"connect_address", "ssh_login", "xray_version"}
     )

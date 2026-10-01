@@ -3,7 +3,8 @@
 Run from the project root: python tests/smoke_xray.py --xray /path/to/xray
 No VPS, CDN, DNS, nginx, ACME, or public TLS deployment is covered. The HTTP
 shim implements only the streaming proxy and OPTIONS-to-POST behavior needed
-by this test. The two-server case does exercise VLESS Vision over pinned TLS.
+by this test, and refuses OPTIONS bodies like Yandex CDN. The two-server case
+does exercise VLESS Vision over pinned TLS.
 """
 
 from __future__ import annotations
@@ -96,14 +97,31 @@ def proxy_handler(upstream_port: int, requests: list[dict], lock: threading.Lock
         def relay(self, streaming: bool) -> None:
             size = int(self.headers.get("Content-Length", "0"))
             body = self.rfile.read(size) if size else None
+            data = [
+                value
+                for key, value in self.headers.items()
+                if key.lower().startswith("x-data-")
+            ]
             with lock:
                 requests.append(
                     {
                         "method": self.command,
                         "size": size,
                         "padding": self.headers.get("X-Cache", ""),
+                        "data_headers": len(data),
+                        "longest_data_header": max(map(len, data), default=0),
+                        "header_bytes": sum(
+                            len(key) + len(value) + 4
+                            for key, value in self.headers.items()
+                        ),
                     }
                 )
+            if self.command == "OPTIONS" and size:
+                # Yandex CDN answers HTTP 413 to any body on GET/HEAD/OPTIONS.
+                self.send_response(413)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             hop_headers = {
                 "connection",
                 "transfer-encoding",
@@ -270,7 +288,7 @@ def run_case(binary: Path, profile: str, chained: bool, certificate: dict) -> No
         "path": "/smoke-test",
         "padding_key": "dc",
         "profile": profile,
-        "xray_version": "26.5.9",
+        "xray_version": "26.9.9",
         "exit": {"host": "127.0.0.1", "user": "root", "port": 22} if chained else None,
         "exit_domain": "relay.example.com" if chained else None,
     }
@@ -309,7 +327,7 @@ def run_case(binary: Path, profile: str, chained: bool, certificate: dict) -> No
             proxy_port = stack.enter_context(
                 serve(proxy_handler(origin_port, requests, lock))
             )
-            # v26.5.9 blocks private destinations in freedom by default. Allow
+            # Xray blocks private destinations in freedom by default. Allow
             # only this local test sink in the temporary test configuration.
             internet = next(
                 item
@@ -368,11 +386,21 @@ def run_case(binary: Path, profile: str, chained: bool, certificate: dict) -> No
                 raise TestFailure(
                     "X-Cache query padding did not survive generated XHTTP extra"
                 )
-            if any(item["size"] > 1_000_000 for item in uploads):
-                raise TestFailure("An upload exceeded configured 1 MB packet maximum")
+            if any(item["size"] for item in uploads):
+                raise TestFailure("An OPTIONS upload carried a request body")
+            if any(not item["data_headers"] for item in uploads):
+                raise TestFailure("An OPTIONS upload carried no X-Data-N headers")
+            if any(item["longest_data_header"] > 4096 for item in uploads):
+                raise TestFailure("An X-Data-N header exceeded 4096 characters")
+            largest = max(item["header_bytes"] for item in uploads)
+            if largest > 32 * 1024:
+                raise TestFailure(
+                    f"Upload headers of {largest} bytes exceed the 32 KB CDN limit"
+                )
             print(
                 f"PASS {topology}/{profile}: {len(payload)} bytes SHA256 verified, "
-                f"{len(uploads)} OPTIONS packets, X-Cache padding preserved"
+                f"{len(uploads)} bodyless OPTIONS packets (headers up to {largest} "
+                "bytes), X-Cache padding preserved"
             )
 
 

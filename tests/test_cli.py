@@ -478,6 +478,14 @@ class InstallationFlowTests(unittest.TestCase):
         self.assertEqual(local, recovered)
         self.assertIn("_recovered_legacy", raw)
 
+    def test_installation_of_an_earlier_release_is_reported_for_reinstall(self):
+        raw = {**config(), "_server_outdated": True}
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            recovered = cli.complete_recovered(raw)
+        self.assertEqual(config(), recovered)
+        self.assertIn("повторной установки", output.getvalue())
+        self.assertIn("_server_outdated", raw)
+
     def test_count_reduction_requires_confirmation_and_never_rotates_bridge_uuid(self):
         value = config()
         with (

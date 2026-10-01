@@ -557,6 +557,12 @@ def recover(
 def complete_recovered(raw: dict, local: dict | None = None) -> dict:
     c = copy.deepcopy(raw)
     legacy = c.pop("_recovered_legacy", False)
+    if c.pop("_server_outdated", False):
+        print(
+            "На сервере установлена схема XHTTP прежней версии программы (данные в теле OPTIONS); Yandex CDN отклоняет такие запросы. "
+            "Ссылки этой версии передают данные в заголовках и заработают после повторной установки: пункт 4 меню или команда deploy. "
+            "UUID и настройки сохраняются."
+        )
     if legacy:
         print(
             "Найдена установка старой версии. UUID и серверные параметры восстановлены; email, название и профиль в старой серверной копии не сохранялись."

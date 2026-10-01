@@ -11,12 +11,14 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from cdn_xhttp.config import domain, load, validate, write_private
 from cdn_xhttp.health import HEALTH_SERVER_SOURCE
+from cdn_xhttp.config import XRAY_VERSION
 from cdn_xhttp.render import (
     client_xray,
     exit_xray,
     extra,
     nginx_config,
     origin_xray,
+    previous_origin_xray,
     vless_uri,
 )
 
@@ -172,6 +174,16 @@ class ValidationTests(unittest.TestCase):
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(original), encoding="utf-8-sig")
             self.assertEqual(validate(original), load(path))
+
+    def test_xray_version_of_earlier_release_is_migrated(self):
+        self.assertEqual("26.9.9", XRAY_VERSION)
+        self.assertEqual(XRAY_VERSION, validate(spec())["xray_version"])
+        self.assertEqual(
+            XRAY_VERSION, validate(spec(xray_version="26.5.9"))["xray_version"]
+        )
+        for value in ("26.7.11", "26.5.9 ", ["26.5.9"], None):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                validate(spec(xray_version=value))
 
     def test_multiuser_uuid_validation_and_legacy_primary_contract(self):
         first = spec()["uuid"]
@@ -365,12 +377,11 @@ class RenderTests(unittest.TestCase):
         original = extra(validate(spec(profile="original")))
         fast = extra(validate(spec(profile="fast")))
         self.assertEqual(30, original["scMinPostsIntervalMs"])
+        self.assertEqual(10, fast["scMinPostsIntervalMs"])
         self.assertGreater(
             fast["scMinPostsIntervalMs"], 0, "Xray treats zero as its default interval"
         )
-        self.assertLess(fast["scMinPostsIntervalMs"], original["scMinPostsIntervalMs"])
-        self.assertEqual(1000000, fast["scMaxEachPostBytes"])
-        self.assertEqual(30, fast["scMaxBufferedPosts"])
+        self.assertEqual(16384, fast["scMaxEachPostBytes"])
         self.assertEqual(
             {
                 key: val
@@ -382,36 +393,131 @@ class RenderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate(spec(profile=0))
 
+    def test_client_uplink_travels_in_headers_of_bodyless_options(self):
+        self.assertEqual(
+            {
+                "xPaddingObfsMode": True,
+                "xPaddingKey": "pad42",
+                "xPaddingHeader": "X-Cache",
+                "xPaddingMethod": "tokenish",
+                "xPaddingPlacement": "queryInHeader",
+                "xPaddingBytes": "100-1000",
+                "scMaxEachPostBytes": 16384,
+                "scMinPostsIntervalMs": 10,
+                "uplinkDataPlacement": "header",
+                "uplinkChunkSize": 4096,
+                "uplinkHTTPMethod": "OPTIONS",
+            },
+            extra(validate(spec(padding_key="pad42"))),
+        )
+
+    def test_mode_stays_outside_extra_and_xmux_is_not_set(self):
+        value = validate(spec())
+        settings = client_xray(value)["outbounds"][0]["streamSettings"]
+        self.assertEqual("packet-up", settings["xhttpSettings"]["mode"])
+        for key in ("mode", "xmux", "scMaxConcurrentPosts", "scMaxBufferedPosts"):
+            self.assertNotIn(key, extra(value))
+        query = parse_qs(urlsplit(vless_uri(value)).query)
+        self.assertEqual(["packet-up"], query["mode"])
+
+    def test_origin_reads_header_uplink_and_bodies_of_earlier_clients(self):
+        value = validate(spec(padding_key="pad42"))
+        xhttp = origin_xray(value)["inbounds"][0]["streamSettings"]["xhttpSettings"]
+        self.assertEqual(
+            {
+                "mode": "packet-up",
+                "path": "/api-test",
+                "extra": {
+                    "xPaddingObfsMode": True,
+                    "xPaddingKey": "pad42",
+                    "xPaddingHeader": "X-Cache",
+                    "xPaddingMethod": "tokenish",
+                    "xPaddingPlacement": "queryInHeader",
+                    "xPaddingBytes": "100-1000",
+                    "scMaxEachPostBytes": 1000000,
+                    "scMaxBufferedPosts": 64,
+                    "serverMaxHeaderBytes": 65536,
+                },
+            },
+            xhttp,
+        )
+        # Xray's default placement "auto" reads header, cookie and body.
+        self.assertNotIn("uplinkDataPlacement", xhttp["extra"])
+
+    def test_previous_origin_layout_matches_releases_up_to_0_3_1(self):
+        value = validate(spec(padding_key="pad42"))
+        previous = previous_origin_xray(value)
+        self.assertEqual(
+            {
+                "mode": "packet-up",
+                "path": "/api-test",
+                "scMaxEachPostBytes": 1000000,
+                "scMaxBufferedPosts": 30,
+                "xPaddingObfsMode": True,
+                "xPaddingKey": "pad42",
+                "xPaddingHeader": "X-Cache",
+                "xPaddingMethod": "tokenish",
+                "xPaddingPlacement": "queryInHeader",
+            },
+            previous["inbounds"][0]["streamSettings"]["xhttpSettings"],
+        )
+        current = origin_xray(value)
+        self.assertEqual(current["outbounds"], previous["outbounds"])
+        self.assertEqual(
+            current["inbounds"][0]["settings"], previous["inbounds"][0]["settings"]
+        )
+
+    def test_client_tls_verifies_certificate_with_firefox_fingerprint(self):
+        value = validate(spec())
+        tls = client_xray(value)["outbounds"][0]["streamSettings"]["tlsSettings"]
+        self.assertEqual(
+            {
+                "serverName": "cdn.example.com",
+                "allowInsecure": False,
+                "alpn": ["h2", "http/1.1"],
+                "fingerprint": "firefox",
+            },
+            tls,
+        )
+        query = parse_qs(urlsplit(vless_uri(value)).query)
+        self.assertEqual(["firefox"], query["fp"])
+        self.assertEqual(["h2,http/1.1"], query["alpn"])
+
     def test_options_and_padding_are_consistent_at_both_ends(self):
         value = validate(spec(padding_key="pad42"))
         client_extra = extra(value)
         server_extra = origin_xray(value)["inbounds"][0]["streamSettings"][
             "xhttpSettings"
-        ]
+        ]["extra"]
         self.assertEqual("OPTIONS", client_extra["uplinkHTTPMethod"])
         expected = {
-            "mode": "packet-up",
             "xPaddingObfsMode": True,
             "xPaddingKey": "pad42",
             "xPaddingHeader": "X-Cache",
             "xPaddingMethod": "tokenish",
             "xPaddingPlacement": "queryInHeader",
+            "xPaddingBytes": "100-1000",
         }
         for key, wanted in expected.items():
             self.assertEqual(wanted, client_extra[key], key)
             self.assertEqual(wanted, server_extra[key], key)
+        self.assertLessEqual(
+            client_extra["scMaxEachPostBytes"], server_extra["scMaxEachPostBytes"]
+        )
 
     def test_nginx_converts_options_only_on_xhttp_and_avoids_buffering(self):
         value = validate(spec())
         rendered = nginx_config(value)
         self.assertIn("OPTIONS POST;", rendered)
-        xhttp = re.search(r"location /api-test \{(.*?)\n    \}", rendered, re.S).group(
-            1
-        )
+        xhttp = re.search(
+            r"location \^~ /api-test/ \{(.*?)\n    \}", rendered, re.S
+        ).group(1)
         self.assertIn("proxy_method $cdn_xhttp_proxy_method;", xhttp)
         self.assertIn("proxy_buffering off;", xhttp)
         self.assertIn("proxy_request_buffering off;", xhttp)
+        self.assertIn("proxy_cache off;", xhttp)
         self.assertIn("proxy_pass_request_headers on;", xhttp)
+        self.assertIn("proxy_read_timeout 3600s;", xhttp)
         health = re.search(
             r"location = /cdn-check \{(.*?)\n    \}", rendered, re.S
         ).group(1)
@@ -420,6 +526,45 @@ class RenderTests(unittest.TestCase):
         self.assertIn("127.0.0.1:8004", health)
         self.assertIn("large_client_header_buffers 8 128k;", rendered)
         self.assertIn("gzip off;", rendered)
+
+    def test_nginx_matches_only_the_exact_xhttp_path_prefix(self):
+        rendered = nginx_config(validate(spec(path="/api-custom/upload")))
+        self.assertIn("location ^~ /api-custom/upload/ {", rendered)
+        self.assertIn("location = /api-custom/upload { return 404; }", rendered)
+        # A bare prefix location would also route /api-custom/uploadX to Xray.
+        self.assertNotIn("location /api-custom/upload {", rendered)
+
+    def test_nginx_keeps_upstream_and_edge_connections_alive(self):
+        rendered = nginx_config(validate(spec()))
+        upstream = re.search(
+            r"upstream cdn_xhttp_origin \{(.*?)\n\}", rendered, re.S
+        ).group(1)
+        for directive in (
+            "server 127.0.0.1:8003;",
+            "keepalive 64;",
+            "keepalive_requests 100000;",
+            "keepalive_timeout 120s;",
+        ):
+            self.assertIn(directive, upstream)
+        xhttp = re.search(
+            r"location \^~ /api-test/ \{(.*?)\n    \}", rendered, re.S
+        ).group(1)
+        self.assertIn("proxy_pass http://cdn_xhttp_origin;", xhttp)
+        self.assertIn("proxy_http_version 1.1;", xhttp)
+        self.assertIn('proxy_set_header Connection "";', xhttp)
+        server = rendered.split("listen 443 ssl http2;", 1)[1]
+        self.assertIn("keepalive_requests 100000;", server)
+        self.assertIn("keepalive_timeout 300s;", server)
+
+    def test_nginx_header_buffers_fit_one_header_packet(self):
+        rendered = nginx_config(validate(spec()))
+        count, size = re.search(
+            r"large_client_header_buffers (\d+) (\d+)k;", rendered
+        ).groups()
+        # One packet: 16 KiB base64url in 4096-character X-Data-N headers plus
+        # padding, about 23 KB; the CDN forwards up to 32 KB of headers.
+        self.assertGreaterEqual(int(count) * int(size), 32)
+        self.assertGreaterEqual(int(size), 5)
 
     def test_acme_bootstrap_does_not_require_unissued_tls_files(self):
         rendered = nginx_config(validate(spec()), tls=False)

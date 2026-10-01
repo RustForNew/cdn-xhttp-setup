@@ -9,7 +9,10 @@ import unicodedata
 import uuid
 from pathlib import Path
 
-XRAY_VERSION = "26.5.9"
+XRAY_VERSION = "26.9.9"
+# Earlier releases pinned these versions. Saved settings that carry one of
+# them are migrated: the next deployment installs XRAY_VERSION.
+PREVIOUS_XRAY_VERSIONS = frozenset({"26.5.9"})
 DEFAULT_PATH = "/api-test"
 
 
@@ -148,7 +151,10 @@ def validate(value: dict) -> dict:
     c["profile"] = c.get("profile", "fast")
     if c["profile"] not in {"fast", "original"}:
         raise ValueError("profile должен быть fast или original")
-    c["xray_version"] = c.get("xray_version", XRAY_VERSION)
+    version = c.get("xray_version", XRAY_VERSION)
+    if isinstance(version, str) and version in PREVIOUS_XRAY_VERSIONS:
+        version = XRAY_VERSION
+    c["xray_version"] = version
     if c["xray_version"] != XRAY_VERSION:
         raise ValueError(f"Эта версия установщика проверена с Xray {XRAY_VERSION}")
     c["exit"] = server(c["exit"]) if c.get("exit") else None

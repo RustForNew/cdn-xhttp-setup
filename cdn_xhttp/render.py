@@ -18,6 +18,13 @@ def _client_uuid(c: dict, index: int) -> str:
     return values[index]
 
 
+ORIGIN_PORT = 8003
+CLIENT_POST_BYTES = 16384
+UPLINK_CHUNK_SIZE = 4096
+SERVER_POST_BYTES = 1000000
+SERVER_MAX_HEADER_BYTES = 65536
+
+
 def padding(c: dict) -> dict:
     return {
         "xPaddingObfsMode": True,
@@ -25,21 +32,69 @@ def padding(c: dict) -> dict:
         "xPaddingHeader": "X-Cache",
         "xPaddingMethod": "tokenish",
         "xPaddingPlacement": "queryInHeader",
+        "xPaddingBytes": "100-1000",
     }
 
 
 def extra(c: dict) -> dict:
+    """Client uplink travels in the headers of a bodyless OPTIONS request.
+
+    Yandex CDN answers HTTP 413 to any body on GET/HEAD/OPTIONS and offers no
+    POST. Each packet (up to 16 KiB) is therefore split into X-Data-N request
+    headers of 4096 characters; the origin raises its header limit and Nginx
+    turns OPTIONS into POST. Zero would be Xray's 30 ms default, never "fast".
+    The mode belongs to xhttpSettings, outside this dictionary.
+    """
     return {
-        "mode": "packet-up",
-        "scMaxEachPostBytes": 1000000,
-        "scMinPostsIntervalMs": 5 if c["profile"] == "fast" else 30,
-        "scMaxBufferedPosts": 30,
         **padding(c),
+        "scMaxEachPostBytes": CLIENT_POST_BYTES,
+        "scMinPostsIntervalMs": 10 if c["profile"] == "fast" else 30,
+        "uplinkDataPlacement": "header",
+        "uplinkChunkSize": UPLINK_CHUNK_SIZE,
         "uplinkHTTPMethod": "OPTIONS",
     }
 
 
+def server_extra(c: dict) -> dict:
+    """Origin inbound. Placement stays Xray's default "auto": headers, cookie
+    and body are all read, so clients of earlier releases keep working."""
+    return {
+        **padding(c),
+        "scMaxEachPostBytes": SERVER_POST_BYTES,
+        "scMaxBufferedPosts": 64,
+        "serverMaxHeaderBytes": SERVER_MAX_HEADER_BYTES,
+    }
+
+
 def origin_xray(c: dict) -> dict:
+    return _origin_xray(
+        c,
+        {"mode": "packet-up", "path": c["path"], "extra": server_extra(c)},
+    )
+
+
+def previous_origin_xray(c: dict) -> dict:
+    """Origin config exactly as releases up to 0.3.1 rendered it.
+
+    Used only to recognize an existing installation of an earlier release
+    during recovery and compare-and-swap; it is never installed.
+    """
+    previous_padding = {
+        key: value for key, value in padding(c).items() if key != "xPaddingBytes"
+    }
+    return _origin_xray(
+        c,
+        {
+            "mode": "packet-up",
+            "path": c["path"],
+            "scMaxEachPostBytes": SERVER_POST_BYTES,
+            "scMaxBufferedPosts": 30,
+            **previous_padding,
+        },
+    )
+
+
+def _origin_xray(c: dict, xhttp_settings: dict) -> dict:
     outbound = {"tag": "internet", "protocol": "freedom"}
     if c.get("exit"):
         outbound = {
@@ -76,7 +131,7 @@ def origin_xray(c: dict) -> dict:
             {
                 "tag": "from-cdn",
                 "listen": "127.0.0.1",
-                "port": 8003,
+                "port": ORIGIN_PORT,
                 "protocol": "vless",
                 "settings": {
                     "users": [{"id": identity} for identity in _uuids(c)],
@@ -85,13 +140,7 @@ def origin_xray(c: dict) -> dict:
                 "streamSettings": {
                     "network": "xhttp",
                     "security": "none",
-                    "xhttpSettings": {
-                        "mode": "packet-up",
-                        "path": c["path"],
-                        "scMaxEachPostBytes": 1000000,
-                        "scMaxBufferedPosts": 30,
-                        **padding(c),
-                    },
+                    "xhttpSettings": xhttp_settings,
                 },
             }
         ],
@@ -166,6 +215,7 @@ def client_xray(c: dict, index: int = 0) -> dict:
                         "serverName": c["cdn_domain"],
                         "allowInsecure": False,
                         "alpn": ["h2", "http/1.1"],
+                        "fingerprint": "firefox",
                     },
                     "xhttpSettings": {
                         "host": c["cdn_domain"],
@@ -188,6 +238,7 @@ def vless_uri(c: dict, index: int = 0) -> str:
         "encryption": "none",
         "security": "tls",
         "sni": c["cdn_domain"],
+        "fp": "firefox",
         "alpn": "h2,http/1.1",
         "type": "xhttp",
         "host": c["cdn_domain"],
@@ -225,9 +276,20 @@ server {{
 """
     if not tls:
         return prefix
+    # Header-borne uplink means about 100 small requests per second for each
+    # uploading client. Without upstream keepalive every request opens a new
+    # loopback connection; their TIME_WAIT entries fill nf_conntrack and the
+    # host drops new CDN connections (the edge answers 502). nginx 1.18 also
+    # closes a client connection after 100 requests by default.
     return (
         prefix
         + f"""
+upstream cdn_xhttp_origin {{
+    server 127.0.0.1:{ORIGIN_PORT};
+    keepalive 64;
+    keepalive_requests 100000;
+    keepalive_timeout 120s;
+}}
 server {{
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
@@ -235,7 +297,10 @@ server {{
     ssl_certificate /etc/letsencrypt/live/{host}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{host}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    keepalive_requests 100000;
+    keepalive_timeout 300s;
     client_max_body_size 2m;
+    # One 16 KiB packet is about 23 KB of X-Data-N and padding headers.
     client_header_buffer_size 64k;
     large_client_header_buffers 8 128k;
     # Ubuntu 22.04 ships nginx 1.18; keep its HTTP/2-specific limits.
@@ -254,8 +319,10 @@ server {{
         proxy_read_timeout 20s;
         proxy_send_timeout 20s;
     }}
-    location {c["path"]} {{
-        proxy_pass http://127.0.0.1:8003;
+    location = {c["path"]} {{ return 404; }}
+    location ^~ {c["path"]}/ {{
+        proxy_pass http://cdn_xhttp_origin;
+        # Xray answers a bare OPTIONS itself; only POST carries a packet.
         proxy_method $cdn_xhttp_proxy_method;
         proxy_http_version 1.1;
         proxy_set_header Connection "";
@@ -266,6 +333,7 @@ server {{
         proxy_set_header X-Forwarded-Proto $scheme;
         proxy_buffering off;
         proxy_request_buffering off;
+        proxy_cache off;
         proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }}

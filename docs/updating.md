@@ -8,7 +8,7 @@
 
 1. Закройте установщик. Останавливать CDN или VPS не требуется.
 2. Сохраните копию всей старой папки программы. Не удаляйте оригинал до проверки новой версии.
-3. Откройте [последний выпуск на GitHub](https://github.com/RustForNew/cdn-xhttp-setup/releases/latest). В Assets скачайте `cdn-xhttp-setup-vX.Y.Z.zip`; для версии 0.3.1 — `cdn-xhttp-setup-v0.3.1.zip`. Распакуйте в отдельную папку.
+3. Откройте [последний выпуск на GitHub](https://github.com/RustForNew/cdn-xhttp-setup/releases/latest). В Assets скачайте `cdn-xhttp-setup-vX.Y.Z.zip`; для версии 0.4.0 — `cdn-xhttp-setup-v0.4.0.zip`. Распакуйте в отдельную папку.
 4. Перенесите из старой папки в новую свои файлы:
    - `deployment.json` — домены, адреса серверов, параметры и UUID;
    - `deployment.pending.json`, если существует, — незавершённое изменение с теми же UUID;

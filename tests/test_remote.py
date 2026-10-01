@@ -137,7 +137,11 @@ class FakeChannel:
         return bool(self.chunks)
 
     def recv(self, size):
-        return self.chunks.popleft()
+        # An empty read is EOF, as in paramiko after the remote side closes.
+        return self.chunks.popleft() if self.chunks else b""
+
+    def settimeout(self, value):
+        assert value > 0
 
     def exit_status_ready(self):
         # Deliberately ready while unread data still exists.
@@ -182,6 +186,27 @@ def test_stream_failure_still_closes_channel():
             channel_client(channel), "script", log=logs.append, secrets=[]
         )
     assert logs == ["nginx test failed"]
+    assert channel.closed
+
+
+class LateOutputChannel(FakeChannel):
+    """Output arrives after recv_ready() said no but before the exit check."""
+
+    def recv_ready(self):
+        return False
+
+
+def test_stream_reads_output_that_arrives_just_before_exit_status():
+    channel = LateOutputChannel(
+        [b"Preflight passed\n", b"ERROR: nginx.conf is customized\n"], status=1
+    )
+    logs = []
+    with pytest.raises(remote.RemoteCommandError) as caught:
+        remote._stream_command(
+            channel_client(channel), "script", log=logs.append, secrets=[]
+        )
+    assert caught.value.status == 1
+    assert logs == ["Preflight passed", "ERROR: nginx.conf is customized"]
     assert channel.closed
 
 
@@ -468,6 +493,66 @@ def test_legacy_recovery_preserves_all_users_and_transport(config, bridge, layou
     assert recovered["uuids"] == c["uuids"]
 
 
+@pytest.mark.parametrize(
+    "output",
+    [
+        b"Sorry, try again.\nsudo: 1 incorrect password attempt\n",
+        b"ERROR: Another cdn-xhttp deployment is running; retry when it finishes\n",
+        b"ERROR: Incomplete installation; inspect the VPS before continuing\n",
+    ],
+)
+def test_failed_recovery_reports_the_remote_reason_without_secrets(
+    config, tmp_path, output
+):
+    from cdn_xhttp.config import validate
+
+    c = validate(config)
+    c["origin"]["user"] = "ubuntu"
+    # A misbehaving remote program could echo the sudo password.
+    channel = FakeChannel([b"input was sudo-secret\n", output], status=1)
+    with patch.object(remote, "_connect", return_value=channel_client(channel)):
+        with pytest.raises(remote.RemoteError) as caught:
+            remote.recover_config(
+                c["origin"],
+                password="ssh-secret",
+                sudo_password="sudo-secret",
+                known_hosts=tmp_path / "known_hosts",
+                confirm_host=lambda _: True,
+            )
+    message = str(caught.value)
+    assert "see the output above" not in message
+    assert output.decode().splitlines()[-1] in message
+    assert "exit status 1" in message
+    assert "sudo-secret" not in message and "ssh-secret" not in message
+    assert channel.sent == b"sudo-secret\n"
+
+
+def test_unsupported_saved_setup_explains_the_validation_error(config, tmp_path):
+    import base64
+    import json
+    from cdn_xhttp.config import validate
+    from cdn_xhttp.render import origin_xray
+
+    c = validate(config)
+    payload = {
+        "deployment.json": json.loads(remote._identity(c, "origin")),
+        "config.json": origin_xray(c),
+        "setup.json": {**c, "xray_version": "1.2.3"},
+    }
+    line = "CDN_SETUP:" + base64.b64encode(json.dumps(payload).encode()).decode()
+    channel = FakeChannel([line.encode() + b"\n"])
+    with patch.object(remote, "_connect", return_value=channel_client(channel)):
+        with pytest.raises(remote.RemoteError, match="26.9.9") as caught:
+            remote.recover_config(
+                c["origin"],
+                password=None,
+                sudo_password=None,
+                known_hosts=tmp_path / "known_hosts",
+                confirm_host=lambda _: True,
+            )
+    assert c["uuid"] not in str(caught.value)
+
+
 def test_recovery_over_ssh_is_read_only_and_never_logs_private_payload(
     config, tmp_path
 ):
@@ -591,7 +676,9 @@ def test_legacy_certificate_ownership_survives_a_to_b_to_a(tmp_path):
     import sys
 
     root = tmp_path / "ownership"
+    live = tmp_path / "live"
     (root / "certificates").mkdir(parents=True)
+    (live / "a.example.com").mkdir(parents=True)
     a = {"role": "origin", "domain": "a.example.com", "cdn_domain": "cdn.example.com"}
     b = {**a, "domain": "b.example.com"}
     (root / "certificate-owner.json").write_text(json.dumps(a), encoding="utf-8")
@@ -599,8 +686,14 @@ def test_legacy_certificate_ownership_survives_a_to_b_to_a(tmp_path):
         "\nPY_KEEP_CERT", 1
     )[0]
     source = source.replace("'/var/lib/cdn-xhttp'", repr(root.as_posix()))
+    source = source.replace("'/etc/letsencrypt/live'", repr(live.as_posix()))
     subprocess.run([sys.executable, "-c", source], check=True)
     assert json.loads((root / "certificates/a.example.com.json").read_text()) == a
+    # A marker without a certificate (failed first install) is not migrated.
+    (root / "certificate-owner.json").write_text(json.dumps(b), encoding="utf-8")
+    subprocess.run([sys.executable, "-c", source], check=True)
+    assert not (root / "certificates/b.example.com.json").exists()
+    (root / "certificate-owner.json").write_text(json.dumps(a), encoding="utf-8")
     (root / "certificate-owner.json").write_text(json.dumps(b), encoding="utf-8")
     guard = remote._PREFLIGHT.split("<<'PY_CERT'\n", 1)[1].split("\nPY_CERT", 1)[0]
     guard = guard.replace(
@@ -673,3 +766,128 @@ def test_metadata_compare_and_swap_rejects_concurrent_settings_but_accepts_local
     assert (result.returncode == 0) == (
         changed_field in {"connect_address", "ssh_login", "xray_version"}
     )
+
+
+def ownership_script(tmp_path, *, managed, identity, previous=""):
+    """The real preflight ownership block, run against temporary paths."""
+    import base64
+    import json
+    import shlex
+    import sys
+
+    block = remote._PREFLIGHT.split(
+        "[[ ! -L /var/lib/cdn-xhttp && ", 1
+    )[1].split("for unit in cdn-xhttp.service", 1)[0]
+    block = "[[ ! -L /var/lib/cdn-xhttp && " + block
+    state = (tmp_path / "state").as_posix()
+    live = (tmp_path / "live").as_posix()
+    block = block.replace("/var/lib/cdn-xhttp", state).replace(
+        "/etc/letsencrypt/live", live
+    )
+    encode = lambda value: base64.b64encode(json.dumps(value).encode()).decode()
+    python = Path(sys.executable).as_posix()
+    return (
+        "set -Eeuo pipefail\n"
+        "fail() { printf 'ERROR: %s\\n' \"$*\" >&2; exit 1; }\n"
+        f"python3() {{ {shlex.quote(python)} \"$@\"; }}\n"
+        f"MANAGED={managed}\nROLE=origin\nDOMAIN=origin.example.com\n"
+        f"IDENTITY={shlex.quote(encode(identity))}\n"
+        f"PREVIOUS_IDENTITY={shlex.quote(encode(previous) if previous else '')}\n"
+        + block
+        + "echo OWNERSHIP-OK\n"
+    )
+
+
+def run_ownership(tmp_path, **kwargs):
+    return subprocess.run(
+        [bash_path()],
+        input=ownership_script(tmp_path, **kwargs),
+        text=True,
+        encoding="utf-8",
+        capture_output=True,
+        timeout=20,
+    )
+
+
+def write_json(path, value):
+    import json
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
+IDENTITY = {"role": "origin", "domain": "origin.example.com", "cdn_domain": "cdn.example.com"}
+
+
+def test_retry_after_failed_first_install_with_a_corrected_cdn_domain(tmp_path):
+    # 0.3.1 wrote the owner marker before certbot and never removed it.
+    stale = {**IDENTITY, "cdn_domain": "typo-cdn.example.com"}
+    write_json(tmp_path / "state" / "certificate-owner.json", stale)
+    result = run_ownership(tmp_path, managed=0, identity=IDENTITY)
+    assert result.returncode == 0, result.stderr
+    assert "OWNERSHIP-OK" in result.stdout
+
+
+def test_retry_with_a_corrected_origin_domain_ignores_a_marker_without_certificate(
+    tmp_path,
+):
+    stale = {**IDENTITY, "domain": "typo-origin.example.com"}
+    write_json(tmp_path / "state" / "certificate-owner.json", stale)
+    write_json(tmp_path / "state" / "certificates" / "typo-origin.example.com.json", stale)
+    result = run_ownership(tmp_path, managed=0, identity=IDENTITY)
+    assert result.returncode == 0, result.stderr
+
+
+def test_certificate_issued_by_an_earlier_attempt_can_be_reused(tmp_path):
+    (tmp_path / "live" / "origin.example.com").mkdir(parents=True)
+    write_json(
+        tmp_path / "state" / "certificates" / "origin.example.com.json",
+        {**IDENTITY, "cdn_domain": "typo-cdn.example.com"},
+    )
+    result = run_ownership(tmp_path, managed=0, identity=IDENTITY)
+    assert result.returncode == 0, result.stderr
+
+
+def test_unmanaged_certificate_for_the_domain_is_still_refused(tmp_path):
+    (tmp_path / "live" / "origin.example.com").mkdir(parents=True)
+    (tmp_path / "state").mkdir()
+    result = run_ownership(tmp_path, managed=0, identity=IDENTITY)
+    assert result.returncode != 0
+    assert "unmanaged certificate" in result.stderr
+    write_json(
+        tmp_path / "state" / "certificates" / "origin.example.com.json",
+        {**IDENTITY, "role": "exit"},
+    )
+    assert run_ownership(tmp_path, managed=0, identity=IDENTITY).returncode != 0
+
+
+def test_managed_installation_keeps_its_ownership_check(tmp_path):
+    write_json(
+        tmp_path / "state" / "certificate-owner.json",
+        {**IDENTITY, "domain": "other.example.com"},
+    )
+    result = run_ownership(tmp_path, managed=1, identity=IDENTITY)
+    assert result.returncode != 0
+    assert "belongs to another deployment" in result.stderr
+    write_json(tmp_path / "state" / "certificate-owner.json", IDENTITY)
+    assert run_ownership(tmp_path, managed=1, identity=IDENTITY).returncode == 0
+
+
+def test_certificate_claims_are_written_only_after_certbot():
+    install = remote._INSTALL
+    first_certbot = install.index("certbot certonly")
+    for claim in (
+        '> "/var/lib/cdn-xhttp/certificates/$DOMAIN.json"',
+        "> /var/lib/cdn-xhttp/certificate-owner.json",
+    ):
+        positions = [
+            index
+            for index in range(len(install))
+            if install.startswith(claim, index)
+        ]
+        assert positions
+        assert all(index > first_certbot for index in positions), claim
+    # The global owner changes only on successful completion.
+    owner = install.index("> /var/lib/cdn-xhttp/certificate-owner.json")
+    assert install.index("COMPLETE=1") > owner
+    assert install.index("> /etc/cdn-xhttp/deployment.json") < owner

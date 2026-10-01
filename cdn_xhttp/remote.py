@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import tempfile
 import time
 from typing import Callable
@@ -21,6 +22,16 @@ from typing import Callable
 
 class RemoteError(RuntimeError):
     """A deployment or SSH connection failed without exposing credentials."""
+
+
+class RemoteCommandError(RemoteError):
+    """The remote command ran and exited with a non-zero status."""
+
+    def __init__(self, status: int):
+        super().__init__(
+            f"Remote installer exited with status {status}; see the output above"
+        )
+        self.status = status
 
 
 XRAY_SERVICE = """[Unit]
@@ -270,13 +281,32 @@ for item in "${OWN_PATHS[@]}"; do
     fi
 done
 [[ ! -L /var/lib/cdn-xhttp && ! -L /var/lib/cdn-xhttp/certificate-owner.json ]] || fail "Unexpected certificate ownership symlink."
-if [[ -e /var/lib/cdn-xhttp/certificate-owner.json ]]; then
+[[ ! -L /var/lib/cdn-xhttp/certificates && ! -L "/var/lib/cdn-xhttp/certificates/$DOMAIN.json" ]] || fail "Unexpected certificate record symlink."
+if [[ "$MANAGED" == 1 && -e /var/lib/cdn-xhttp/certificate-owner.json ]]; then
     CERT_OWNER=$(cat /var/lib/cdn-xhttp/certificate-owner.json)
     [[ "$CERT_OWNER" == "$(printf '%s' "$IDENTITY" | base64 -d)" || ( -n "$PREVIOUS_IDENTITY" && "$CERT_OWNER" == "$(printf '%s' "$PREVIOUS_IDENTITY" | base64 -d)" ) ]] || fail "Certificate ownership belongs to another deployment."
-elif [[ "$MANAGED" == 0 && -e "/etc/letsencrypt/live/$DOMAIN" ]]; then
-    fail "An existing unmanaged certificate uses this domain; use a fresh VPS or inspect it manually."
 fi
-[[ ! -L /var/lib/cdn-xhttp/certificates && ! -L "/var/lib/cdn-xhttp/certificates/$DOMAIN.json" ]] || fail "Unexpected certificate record symlink."
+if [[ "$MANAGED" == 0 && -e "/etc/letsencrypt/live/$DOMAIN" ]]; then
+    # Without a managed installation only a certificate this program issued for
+    # the same domain and role (an earlier failed attempt) may be reused. Its
+    # CDN domain may differ: a retry often corrects exactly that. A marker of a
+    # failed first installation without a certificate grants nothing.
+    python3 - "$ROLE" "$DOMAIN" <<'PY_FIRST_CERT'
+import json, pathlib, sys
+role, domain = sys.argv[1:3]
+base = pathlib.Path('/var/lib/cdn-xhttp')
+def issued_here(path):
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    return isinstance(value, dict) and value.get('role') == role and value.get('domain') == domain
+if not any(issued_here(path) for path in (base / 'certificates' / (domain + '.json'), base / 'certificate-owner.json')):
+    raise SystemExit('ERROR: An existing unmanaged certificate uses this domain; use a fresh VPS or inspect it manually.')
+PY_FIRST_CERT
+fi
 if [[ -n "$PREVIOUS_IDENTITY" && -e "/etc/letsencrypt/live/$DOMAIN" ]]; then
     # A domain change may not appropriate a certificate from another service.
     python3 - "$PREVIOUS_IDENTITY" "$DOMAIN" <<'PY_CERT'
@@ -470,28 +500,29 @@ install -m 640 -o root -g nogroup "$STAGING/config.json" /etc/cdn-xhttp/config.j
 install -m 600 -o root -g root "$STAGING/setup.json" /etc/cdn-xhttp/setup.json
 install -m 644 "$STAGING/cdn-xhttp.service" /etc/systemd/system/cdn-xhttp.service
 install -d -m 700 /var/lib/cdn-xhttp
-# Domain records are retained with certificates on rollback; global ownership
-# changes only on successful completion of a managed update.
+# A domain record is written only after certbot has issued that certificate
+# and is retained with it on rollback; the global owner changes only on
+# successful completion. A failed attempt without a certificate leaves no
+# claim that could block a retry with corrected domains.
 install -d -m 700 /var/lib/cdn-xhttp/certificates
 # Migrate the legacy single ownership record before retaining a new domain.
 # This lets an existing installation return to its own earlier certificate.
 python3 - <<'PY_KEEP_CERT'
 import json, pathlib
 base = pathlib.Path('/var/lib/cdn-xhttp')
+live = pathlib.Path('/etc/letsencrypt/live')
 owner = base / 'certificate-owner.json'
 if owner.exists():
     identity = json.loads(owner.read_text())
     record = base / 'certificates' / (identity['domain'] + '.json')
     if record.is_symlink():
         raise SystemExit('ERROR: Certificate ownership record is a symlink.')
-    if not record.exists():
+    # A marker left by a failed first installation of an earlier release has
+    # no certificate behind it and must not become a domain record.
+    if not record.exists() and (live / identity['domain']).exists():
         record.write_text(json.dumps(identity, sort_keys=True) + '\n')
         record.chmod(0o600)
 PY_KEEP_CERT
-printf '%s' "$IDENTITY" | base64 -d > "/var/lib/cdn-xhttp/certificates/$DOMAIN.json"
-if [[ "$MANAGED" == 0 ]]; then
-    printf '%s' "$IDENTITY" | base64 -d > /var/lib/cdn-xhttp/certificate-owner.json
-fi
 
 if command -v ufw >/dev/null && ufw status | grep -q '^Status: active'; then
     note "UFW is active: preserving SSH before adding service rules."
@@ -518,9 +549,11 @@ if [[ "$ROLE" == origin ]]; then
     systemctl enable --now nginx.service
     systemctl reload nginx.service
     certbot certonly --webroot -w /var/www/cdn-xhttp-acme --non-interactive --agree-tos --email "$EMAIL" --cert-name "$DOMAIN" --keep-until-expiring -d "$DOMAIN"
+    printf '%s' "$IDENTITY" | base64 -d > "/var/lib/cdn-xhttp/certificates/$DOMAIN.json"
     install -m 644 "$STAGING/nginx-tls.conf" /etc/nginx/sites-available/cdn-xhttp.conf
 else
     certbot certonly --standalone --non-interactive --agree-tos --email "$EMAIL" --cert-name "$DOMAIN" --keep-until-expiring -d "$DOMAIN"
+    printf '%s' "$IDENTITY" | base64 -d > "/var/lib/cdn-xhttp/certificates/$DOMAIN.json"
     install -d -m 750 -o root -g nogroup /etc/cdn-xhttp/tls
     install -m 640 -o root -g nogroup "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" /etc/cdn-xhttp/tls/fullchain.pem
     install -m 640 -o root -g nogroup "/etc/letsencrypt/live/$DOMAIN/privkey.pem" /etc/cdn-xhttp/tls/privkey.pem
@@ -655,24 +688,47 @@ def _connect(
 
 _RECOVER_SOURCE = r"""
 import base64, fcntl, json, pathlib
-with open('/run/lock/cdn-xhttp.lock', 'a') as lock:
-    fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+try:
+    lock = open('/run/lock/cdn-xhttp.lock', 'a')
+except OSError as exc:
+    raise SystemExit('ERROR: Cannot open the deployment lock: %s' % exc.strerror)
+with lock:
+    try:
+        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise SystemExit('ERROR: Another cdn-xhttp deployment is running; retry when it finishes')
     root = pathlib.Path('/etc/cdn-xhttp')
     if root.is_symlink():
-        raise SystemExit('Managed directory is a symlink')
+        raise SystemExit('ERROR: Managed directory is a symlink')
     payload = {}
     for name in ('deployment.json', 'config.json', 'setup.json'):
         p = root / name
         if p.is_symlink():
-            raise SystemExit('Managed file is a symlink')
+            raise SystemExit('ERROR: Managed file is a symlink: %s' % name)
         if p.exists():
             if p.stat().st_size > 1048576:
-                raise SystemExit('Managed file is too large')
-            payload[name] = json.loads(p.read_text())
+                raise SystemExit('ERROR: Managed file is too large: %s' % name)
+            try:
+                payload[name] = json.loads(p.read_text())
+            except ValueError:
+                raise SystemExit('ERROR: Managed file is not valid JSON: %s' % name)
     if payload and ('deployment.json' not in payload or 'config.json' not in payload):
-        raise SystemExit('Incomplete installation; inspect the VPS before continuing')
+        raise SystemExit('ERROR: Incomplete installation; inspect the VPS before continuing')
     print('CDN_SETUP:' + base64.b64encode(json.dumps(payload).encode()).decode())
 """
+
+
+def _recovery_failure(status: int, lines: list[str]) -> str:
+    """Explain a failed read with the last remote lines; they are redacted."""
+    details = [
+        line.strip()[:300]
+        for line in lines
+        if line.strip() and not line.startswith("CDN_SETUP:")
+    ][-5:]
+    message = f"Could not read the saved setup on the server (exit status {status})"
+    if not details:
+        return message + "; the server printed no details"
+    return message + ": " + " | ".join(details)
 
 
 def _recovered_config(payload: dict, server: dict) -> dict | None:
@@ -770,14 +826,19 @@ def recover_config(
                 raise RemoteError("Server setup response is too large")
             lines.append(line)
 
-        _stream_command(
-            client,
-            command,
-            stdin_secret=sudo_input,
-            log=collect,
-            secrets=[],
-            timeout=60,
-        )
+        try:
+            _stream_command(
+                client,
+                command,
+                stdin_secret=sudo_input,
+                log=collect,
+                # sudo or Python may echo input; never surface a password.
+                secrets=[password or "", sudo_password or ""],
+                timeout=60,
+            )
+        except RemoteCommandError as exc:
+            # The output was collected, not printed: report it here.
+            raise RemoteError(_recovery_failure(exc.status, lines)) from None
         encoded = [
             line.removeprefix("CDN_SETUP:")
             for line in lines
@@ -785,9 +846,21 @@ def recover_config(
         ]
         if len(encoded) != 1:
             raise RemoteError("Server did not return a valid saved setup")
-        return _recovered_config(
-            json.loads(base64.b64decode(encoded[0], validate=True)), server
-        )
+        try:
+            payload = json.loads(base64.b64decode(encoded[0], validate=True))
+            return _recovered_config(payload, server)
+        except RemoteError:
+            raise
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # Validation messages are fixed texts without secrets.
+            reason = (
+                str(exc)
+                if type(exc) is ValueError and str(exc)
+                else type(exc).__name__
+            )
+            raise RemoteError(
+                f"Saved server setup is not supported ({reason}); existing settings were preserved"
+            ) from None
     except paramiko.BadHostKeyException:
         raise RemoteError(
             "SSH host key changed. Verify it independently before updating known_hosts."
@@ -822,6 +895,19 @@ def _stream_command(
     channel.set_combine_stderr(True)
     pending = b""
     deadline = time.monotonic() + timeout
+    timed_out = "SSH deployment timed out; inspect the server before retrying"
+
+    def consume(chunk: bytes) -> None:
+        nonlocal pending
+        pending += chunk
+        # Preserve complete lines so chunk boundaries cannot expose a
+        # credential split between two recv calls.
+        while b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            log(_redact(line.decode("utf-8", errors="replace").rstrip("\r"), secrets))
+        if len(pending) > 1024 * 1024:
+            raise RemoteError("Remote installer emitted an excessively long output line")
+
     try:
         channel.exec_command(command)
         if stdin_secret is not None:
@@ -829,25 +915,25 @@ def _stream_command(
         channel.shutdown_write()
         while True:
             if time.monotonic() >= deadline:
-                raise RemoteError(
-                    "SSH deployment timed out; inspect the server before retrying"
-                )
+                raise RemoteError(timed_out)
             if channel.recv_ready():
-                pending += channel.recv(65536)
-                # Preserve complete lines so chunk boundaries cannot expose a
-                # credential split between two recv calls.
-                while b"\n" in pending:
-                    line, pending = pending.split(b"\n", 1)
-                    log(
-                        _redact(
-                            line.decode("utf-8", errors="replace").rstrip("\r"), secrets
-                        )
-                    )
-                if len(pending) > 1024 * 1024:
-                    raise RemoteError(
-                        "Remote installer emitted an excessively long output line"
-                    )
+                consume(channel.recv(65536))
             elif channel.exit_status_ready():
+                # Output can arrive between the recv_ready() and
+                # exit_status_ready() checks; read until EOF so the last
+                # lines, usually the error, are never lost.
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RemoteError(timed_out)
+                    channel.settimeout(remaining)
+                    try:
+                        chunk = channel.recv(65536)
+                    except socket.timeout:
+                        raise RemoteError(timed_out) from None
+                    if not chunk:
+                        break
+                    consume(chunk)
                 break
             elif not transport.is_active():
                 raise RemoteError(
@@ -859,9 +945,7 @@ def _stream_command(
             log(_redact(pending.decode("utf-8", errors="replace"), secrets))
         status = channel.recv_exit_status()
         if status != 0:
-            raise RemoteError(
-                f"Remote installer exited with status {status}; see the output above"
-            )
+            raise RemoteCommandError(status)
     finally:
         channel.close()
 
